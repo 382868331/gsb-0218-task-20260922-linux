@@ -14,11 +14,17 @@ import math
 import os
 import sys
 import unittest
+from itertools import combinations
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import periodogram as pg
-from periodogram import periodogram, PeriodogramError, EPS
+from periodogram import (
+    periodogram,
+    joint_periodogram_fit,
+    PeriodogramError,
+    EPS,
+)
 
 TWO_PI = 2.0 * math.pi
 
@@ -132,6 +138,93 @@ def direct_window_modulus(times, weights, freq):
         re += wk * math.cos(ang)
         im += wk * math.sin(ang)
     return math.hypot(re, im) / sum(weights)
+
+
+def joint_normal_equation_reference(times, values, weights, freq_subset):
+    """Weighted LS for c + sum(a_j cos f_j + b_j sin f_j), independent path.
+
+    A hand-built (1+2k)x(1+2k) weighted normal-equation system solved by
+    Gaussian elimination with partial pivoting -- a deliberately different
+    algorithm from the production Householder QR.  Coefficients are solved
+    in the tau = t - t[0] frame (small angles) and returned as
+    ``(c, [(freq, a_tau, b_tau), ...], sse, sse0)``; the original-frame
+    coefficients follow from the same closed-form rotation identity the
+    production code uses.  The caller picks the reference subset itself.
+    """
+    n = len(times)
+    t0 = times[0]
+    tau = [tk - t0 for tk in times]
+    k = len(freq_subset)
+    ncols = 1 + 2 * k
+    mat = [[0.0] * ncols for _ in range(ncols)]
+    rhs = [0.0] * ncols
+    for idx in range(n):
+        g = [1.0]
+        for fr in freq_subset:
+            ang = TWO_PI * fr * tau[idx]
+            g.append(math.cos(ang))
+            g.append(math.sin(ang))
+        wk = weights[idx]
+        yk = values[idx]
+        for i in range(ncols):
+            for j in range(ncols):
+                mat[i][j] += wk * g[i] * g[j]
+            rhs[i] += wk * yk * g[i]
+    a = [row[:] for row in mat]
+    b = rhs[:]
+    for col in range(ncols):
+        piv = max(range(col, ncols), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) <= 1e-14:
+            raise AssertionError("independent reference hit a singular matrix")
+        if piv != col:
+            a[col], a[piv] = a[piv], a[col]
+            b[col], b[piv] = b[piv], b[col]
+        for r in range(col + 1, ncols):
+            q = a[r][col] / a[col][col]
+            for c in range(col, ncols):
+                a[r][c] -= q * a[col][c]
+            b[r] -= q * b[col]
+    x = [0.0] * ncols
+    for r in range(ncols - 1, -1, -1):
+        x[r] = (b[r] - sum(a[r][c] * x[c] for c in range(r + 1, ncols))) \
+            / a[r][r]
+    sse = 0.0
+    for idx in range(n):
+        fit = x[0]
+        for j, fr in enumerate(freq_subset):
+            ang = TWO_PI * fr * tau[idx]
+            fit += x[2 * j + 1] * math.cos(ang) + x[2 * j + 2] * math.sin(ang)
+        d = values[idx] - fit
+        sse += weights[idx] * d * d
+    wsum = sum(weights)
+    wmean = sum(weights[i] * values[i] for i in range(n)) / wsum
+    sse0 = sum(weights[i] * (values[i] - wmean) ** 2 for i in range(n))
+    comps = [
+        (freq_subset[j], x[2 * j + 1], x[2 * j + 2]) for j in range(k)
+    ]
+    return x[0], comps, sse, sse0, t0
+
+
+def enumerate_reference_winner(times, values, weights, grid, max_order=2):
+    """Brute-force every subset with the independent reference.
+
+    Returns ``(best_subset_tuple, best_sse)`` using the SAME selection rule
+    as production (SSE ascending, then frequency lexicographic).  Used only
+    on small grids (n <= ~40, m <= 8).
+    """
+    best_key = None
+    best_sse = None
+    orders = range(1, min(max_order, len(grid)) + 1)
+    for k in orders:
+        for subset in combinations(grid, k):
+            _, _, sse, _, _ = joint_normal_equation_reference(
+                times, values, weights, subset
+            )
+            key = (sse, subset)
+            if best_key is None or key < best_key:
+                best_key = key
+                best_sse = sse
+    return best_key[1], best_sse
 
 
 # --------------------------------------------------------------------------- #
@@ -620,6 +713,426 @@ class TestWindowDirectReference(unittest.TestCase):
                 places=13,
             )
             self.assertLessEqual(res.window_modulus[i], 1.0 + 1e-15)
+
+
+# --------------------------------------------------------------------------- #
+# Joint 1-/2-frequency enumeration
+# --------------------------------------------------------------------------- #
+class TestJointFitNormal(unittest.TestCase):
+    """Two injected harmonics recovered jointly from a finite small grid."""
+
+    def test_two_grid_harmonics_recovered_exactly_dft(self):
+        # Equally spaced data; BOTH injected cycles per sample are DFT bins,
+        # so closed-form orthogonality (no production code) gives the exact
+        # expected joint coefficients.
+        n = 60
+        times = [float(k) for k in range(n)]
+        j1, j2 = 5, 9
+        f1, f2 = j1 / n, j2 / n
+        a1, b1, a2, b2, c0 = 1.30, -0.45, 0.60, 0.85, 2.0
+        values = [
+            c0 + a1 * math.cos(TWO_PI * f1 * k) + b1 * math.sin(TWO_PI * f1 * k)
+            + a2 * math.cos(TWO_PI * f2 * k) + b2 * math.sin(TWO_PI * f2 * k)
+            for k in range(n)
+        ]
+        grid = [j / n for j in (1, 3, 5, 7, 9, 11, 13)]
+        res = joint_periodogram_fit(times, values, None, grid)
+
+        self.assertEqual(res.order, 2)
+        self.assertEqual(res.frequencies, (f1, f2))
+        self.assertEqual(res.models_evaluated, 7 + 7 * 6 // 2)
+        self.assertEqual(res.rank, 5)
+        self.assertLess(res.sse, 1e-26)
+        self.assertAlmostEqual(res.constant, c0, places=12)
+        self.assertAlmostEqual(res.power, 1.0, places=10)
+        # closed-form DFT coefficients (summed directly, no module under test)
+        expected = {
+            f1: (a1, b1, math.hypot(a1, b1), math.atan2(b1, a1)),
+            f2: (a2, b2, math.hypot(a2, b2), math.atan2(b2, a2)),
+        }
+        for comp in res.components:
+            ae, be, ampe, phasee = expected[comp.frequency]
+            self.assertAlmostEqual(comp.cos_coefficient, ae, places=11)
+            self.assertAlmostEqual(comp.sin_coefficient, be, places=11)
+            self.assertAlmostEqual(comp.amplitude, ampe, places=11)
+            self.assertAlmostEqual(wrap_phase(comp.phase - phasee), 0.0,
+                                   places=11)
+
+    def test_uneven_weighted_joint_fit_matches_normal_equations(self):
+        n = 33
+        rnd = lcg(20260924, 3 * n)
+        gaps = [0.05 + 0.4 * u for u in rnd[:n]]
+        times = [sum(gaps[: k + 1]) for k in range(n)]
+        f1, f2 = 0.17, 0.41
+        values = [
+            0.8
+            + 1.1 * math.cos(TWO_PI * f1 * t - 0.6)
+            + 0.5 * math.cos(TWO_PI * f2 * t + 1.3)
+            + 0.02 * 2.0 * (u - 0.5)
+            for t, u in zip(times, rnd[n:2 * n])
+        ]
+        weights = [0.2 + 1.8 * u for u in rnd[2 * n:]]
+        grid = [0.05, 0.17, 0.23, 0.41, 0.55, 0.72]
+
+        res = joint_periodogram_fit(times, values, weights, grid)
+
+        # independent brute-force enumeration of every subset (Gaussian
+        # elimination on the weighted normal equations -- not the QR core)
+        ref_subset, ref_sse = enumerate_reference_winner(
+            times, values, weights, grid
+        )
+        self.assertEqual(res.frequencies, tuple(ref_subset))
+        self.assertEqual(res.order, 2)
+        self.assertAlmostEqual(res.sse, ref_sse, delta=1e-18 + 1e-11 * ref_sse)
+
+        c_ref, comps_ref, sse_ref, sse0_ref, t0 = \
+            joint_normal_equation_reference(
+                times, values, weights, list(res.frequencies)
+            )
+        self.assertAlmostEqual(res.sse, sse_ref,
+                               delta=1e-18 + 1e-11 * sse_ref)
+        self.assertAlmostEqual(res.sse0, sse0_ref,
+                               delta=1e-18 + 1e-12 * sse0_ref)
+        self.assertAlmostEqual(res.power, (sse0_ref - sse_ref) / sse0_ref,
+                               places=10)
+        self.assertAlmostEqual(res.constant, c_ref, places=10)
+        for comp, (freq, a_tau, b_tau) in zip(res.components, comps_ref):
+            theta = TWO_PI * freq * t0
+            ct, st = math.cos(theta), math.sin(theta)
+            a_ref = a_tau * ct - b_tau * st
+            b_ref = a_tau * st + b_tau * ct
+            self.assertAlmostEqual(comp.cos_coefficient, a_ref, places=10)
+            self.assertAlmostEqual(comp.sin_coefficient, b_ref, places=10)
+            self.assertAlmostEqual(comp.amplitude, math.hypot(a_ref, b_ref),
+                                   delta=1e-11 + 1e-10
+                                   * max(1.0, math.hypot(a_ref, b_ref)))
+            self.assertAlmostEqual(
+                wrap_phase(comp.phase - math.atan2(b_ref, a_ref)), 0.0,
+                places=10,
+            )
+
+    def test_global_weight_rescaling_invariant(self):
+        n = 25
+        rnd = lcg(7, 2 * n)
+        # baseline ~6 time units resolves the injected pair well (a short
+        # baseline picks an ill-conditioned pair, which would only measure
+        # roundoff amplification, not scale invariance)
+        times = sorted(6.0 * u for u in rnd[:n])
+        values = [1.0 * math.cos(TWO_PI * 0.2 * t)
+                  + 0.4 * math.cos(TWO_PI * 0.47 * t) + (u - 0.5)
+                  for t, u in zip(times, rnd[n:])]
+        weights = [0.3 + u for u in lcg(99, n)]
+        grid = [0.1, 0.2, 0.33, 0.47, 0.6]
+        r1 = joint_periodogram_fit(times, values, weights, grid)
+        r2 = joint_periodogram_fit(times, values, [3.7 * w for w in weights],
+                                   grid)
+        self.assertEqual(r1.frequencies, r2.frequencies)
+        self.assertEqual(r1.frequencies, (0.2, 0.47))
+        self.assertAlmostEqual(r1.sse / r2.sse, 1.0 / 3.7, places=12)
+        for c1, c2 in zip(r1.components, r2.components):
+            self.assertAlmostEqual(c1.amplitude, c2.amplitude, places=12)
+            self.assertAlmostEqual(c1.phase, c2.phase, places=12)
+
+    def test_max_frequencies_one_scans_singles_only(self):
+        n = 40
+        rnd = lcg(505, 2 * n)
+        times = sorted(2.5 * u for u in rnd[:n])
+        values = [math.cos(TWO_PI * 0.3 * t) + 0.5 * math.cos(TWO_PI * 0.5 * t)
+                  + 0.01 * (u - 0.5)
+                  for t, u in zip(times, rnd[n:])]
+        grid = [0.1, 0.3, 0.5, 0.7]
+        res = joint_periodogram_fit(times, values, None, grid,
+                                    max_frequencies=1)
+        self.assertEqual(res.order, 1)
+        self.assertEqual(res.models_evaluated, 4)
+        # supplementary round-trip consistency with the single-frequency entry
+        single = periodogram(times, values, None, grid)
+        best = min(range(len(grid)), key=lambda i: single.sses[i])
+        self.assertEqual(res.frequencies[0], grid[best])
+        self.assertAlmostEqual(res.sse, single.sses[best], places=12)
+
+    def test_single_grid_point(self):
+        times = [0.0, 0.4, 1.1, 1.7, 2.3]
+        values = [0.3, -0.8, 1.2, -0.2, 0.9]
+        res = joint_periodogram_fit(times, values, None, [0.25])
+        self.assertEqual(res.frequencies, (0.25,))
+        self.assertEqual(res.order, 1)
+        self.assertEqual(res.models_evaluated, 1)
+        c_ref, comps_ref, sse_ref, _, _ = \
+            joint_normal_equation_reference(times, values, [1.0] * 5, [0.25])
+        self.assertAlmostEqual(res.sse, sse_ref, places=12)
+        self.assertAlmostEqual(res.constant, c_ref, places=10)
+
+
+class TestJointFitTieBreak(unittest.TestCase):
+    """Selection is (residual SSE, then frequency lexicographic)."""
+
+    def test_exact_alias_pair_is_rank_deficient_and_loses_to_single(self):
+        # 24 hourly samples spanning a day: f=3 and f=27 cycles/day produce
+        # BIT-IDENTICAL sample columns (27 = 24 + 3 shifts by exactly one
+        # cycle per sample), so the 5-column joint design has rank 3 and the
+        # pair cannot reduce SSE below the single-frequency model.  Under the
+        # lexicographic tie rule the single at the smaller frequency wins.
+        n = 24
+        times = [k / 24.0 for k in range(n)]
+        f0, f_alias = 3.0, 27.0
+        values = [1.4 * math.cos(TWO_PI * f0 * t - 0.35) for t in times]
+
+        res = joint_periodogram_fit(times, values, None, [f0, f_alias])
+        self.assertEqual(res.frequencies, (f0,))
+        self.assertEqual(res.order, 1)
+        self.assertEqual(res.models_evaluated, 3)
+        self.assertLessEqual(res.rank, 3)
+        # expected SSE from the INDEPENDENT 3x3 reference on the single bin
+        _, _, _, sse_ref, _, _ = normal_equation_reference(
+            times, values, [1.0] * n, f0
+        )
+        self.assertLess(sse_ref, 1e-24)
+        self.assertAlmostEqual(res.sse, sse_ref, delta=1e-18 + 1e-12 * sse_ref)
+
+        # with an extra non-alias candidate the genuine two-signal pair wins
+        res2 = joint_periodogram_fit(times, values, None, [2.0, f0, f_alias])
+        self.assertEqual(res2.frequencies, (2.0, f0))
+        self.assertEqual(res2.rank, 5)
+        self.assertLess(res2.sse, res.sse)
+
+    def test_constant_data_tie_goes_to_smallest_single(self):
+        # every subset fits bitwise-constant data with SSE 0: the documented
+        # lexicographic convention must select the single smallest frequency
+        times = sorted(u for u in lcg(11, 12))
+        values = [4.75] * 12
+        grid = [0.1 * j for j in range(1, 9)]
+        res = joint_periodogram_fit(times, values, [0.5 + u for u in lcg(3, 12)],
+                                    grid)
+        self.assertEqual(res.frequencies, (grid[0],))
+        self.assertEqual(res.order, 1)
+        self.assertEqual(res.sse, 0.0)
+        self.assertEqual(res.power, 0.0)
+        self.assertEqual(res.sse0, 0.0)
+        self.assertAlmostEqual(res.constant, 4.75, places=14)
+        self.assertTrue(all(c.amplitude == 0.0 for c in res.components))
+        self.assertTrue(all(c.cos_coefficient == 0.0
+                            and c.sin_coefficient == 0.0
+                            for c in res.components))
+
+    def test_choice_is_deterministic_and_components_ascending(self):
+        n = 30
+        rnd = lcg(808, 2 * n)
+        times = sorted(3.0 * u for u in rnd[:n])
+        values = [(u - 0.5) + math.cos(TWO_PI * 0.22 * t)
+                  for t, u in zip(times, rnd[n:])]
+        grid = [0.1, 0.22, 0.4, 0.61, 0.9]
+        r1 = joint_periodogram_fit(times, values, None, grid)
+        r2 = joint_periodogram_fit(times, values, None, grid)
+        self.assertEqual(r1, r2)
+        self.assertEqual(list(r1.frequencies), sorted(r1.frequencies))
+        self.assertEqual([c.frequency for c in r1.components],
+                         list(r1.frequencies))
+
+
+class TestJointFitCloseAndDegenerate(unittest.TestCase):
+    """Close frequencies and degenerate design matrices."""
+
+    def test_close_frequencies_both_recovered(self):
+        # frequencies 5% apart in absolute terms but resolvable because the
+        # irregular-time baseline (~30 time units) spans many beat periods
+        n = 40
+        rnd = lcg(77, n)
+        times = sorted(30.0 * u for u in rnd)
+        f1, f2 = 0.20, 0.21
+        values = [
+            1.3 * math.cos(TWO_PI * f1 * t - 0.5)
+            + 0.6 * math.cos(TWO_PI * f2 * t + 1.2)
+            + 0.7
+            for t in times
+        ]
+        grid = [0.18, 0.19, 0.20, 0.21, 0.22, 0.24]
+        res = joint_periodogram_fit(times, values, None, grid)
+        self.assertEqual(res.frequencies, (f1, f2))
+        self.assertEqual(res.rank, 5)
+        c_ref, comps_ref, sse_ref, _, t0 = \
+            joint_normal_equation_reference(times, values, [1.0] * n,
+                                            [f1, f2])
+        self.assertAlmostEqual(res.sse, sse_ref, delta=1e-16 + 1e-10 * sse_ref)
+        self.assertAlmostEqual(res.constant, c_ref, places=9)
+        got = {c.frequency: c for c in res.components}
+        for freq, a_tau, b_tau in comps_ref:
+            # rotate the independent reference into the original time frame
+            # with the same exact change-of-variables identity
+            theta = TWO_PI * freq * t0
+            ct, st = math.cos(theta), math.sin(theta)
+            a_ref = a_tau * ct - b_tau * st
+            b_ref = a_tau * st + b_tau * ct
+            self.assertAlmostEqual(got[freq].cos_coefficient, a_ref, places=9)
+            self.assertAlmostEqual(got[freq].sin_coefficient, b_ref, places=9)
+            self.assertAlmostEqual(got[freq].amplitude,
+                                   math.hypot(a_ref, b_ref), places=9)
+            self.assertAlmostEqual(
+                wrap_phase(got[freq].phase - math.atan2(b_ref, a_ref)),
+                0.0, places=9,
+            )
+
+    def test_too_close_frequencies_on_short_baseline_still_fit(self):
+        # the two columns are highly correlated but NOT exactly collinear:
+        # QR must keep full rank (the ill conditioning is reported, not
+        # hidden) and solve exactly for noiseless data
+        times = [0.0, 0.3, 0.7, 1.1, 1.5, 1.9]
+        f1, f2 = 0.20, 0.2005
+        values = [
+            1.2 * math.cos(TWO_PI * f1 * t - 0.5)
+            + 0.3 * math.cos(TWO_PI * f2 * t + 0.9)
+            for t in times
+        ]
+        res = joint_periodogram_fit(times, values, None, [f1, f2])
+        self.assertEqual(res.frequencies, (f1, f2))
+        self.assertEqual(res.rank, 5)
+        self.assertLess(res.sse, 1e-20)
+
+    def test_all_times_equal_degenerate_design(self):
+        # all observations at one instant: every sinusoid column is a
+        # multiple of the constant column -> rank 1, no model beats the
+        # weighted mean; every subset SSE equals SSE0, lex rule picks first
+        times = [1.5] * 6
+        values = [1.0, 2.0, 0.5, 1.2, 0.8, 1.7]
+        weights = [1.0, 0.5, 2.0, 1.0, 0.8, 1.2]
+        grid = [0.2, 0.35, 0.5]
+        res = joint_periodogram_fit(times, values, weights, grid)
+        self.assertEqual(res.frequencies, (0.2,))
+        self.assertLessEqual(res.rank, 2)
+        wmean = sum(w * y for w, y in zip(weights, values)) / sum(weights)
+        sse0 = sum(w * (y - wmean) ** 2
+                   for w, y in zip(weights, values))
+        self.assertAlmostEqual(res.sse0, sse0, places=12)
+        self.assertAlmostEqual(res.sse, sse0, delta=1e-14 * sse0)
+        self.assertAlmostEqual(res.power, 0.0, places=12)
+        self.assertEqual(res.models_evaluated, 3 + 3)
+
+    def test_exact_interpolation_with_five_parameters(self):
+        # n = 5 generic irregular instants: the 5-parameter model spans the
+        # data exactly (full-rank square system), independently confirmed
+        times = [0.0, 0.31, 0.74, 1.33, 2.09]
+        values = [0.4, -1.1, 0.9, 0.2, -0.6]
+        f1, f2 = 0.22, 0.47
+        res = joint_periodogram_fit(times, values, None, [f1, f2])
+        self.assertEqual(res.frequencies, (f1, f2))
+        self.assertEqual(res.rank, 5)
+        self.assertLess(res.sse, 1e-22)
+        _, _, sse_ref, _, _ = joint_normal_equation_reference(
+            times, values, [1.0] * 5, [f1, f2]
+        )
+        self.assertAlmostEqual(res.sse, sse_ref, delta=1e-18 + 1e-10 * sse_ref)
+
+    def test_fewer_observations_than_parameters(self):
+        # n = 3 < 1 + 2*2 = 5: every pair design is rank deficient.  Null
+        # columns get coefficient 0, SSE stays well-defined, and the winner
+        # is the single-frequency model with the smallest residual (the
+        # minimum-contract n = 3 still permits this documented call).
+        times = [0.1, 0.7, 1.3]
+        values = [0.4, -0.9, 1.1]
+        grid = [0.2, 0.35, 0.5]
+        res = joint_periodogram_fit(times, values, None, grid)
+        self.assertLessEqual(res.rank, 3)
+        # reference: best SSE over the three singles via independent 3x3
+        single = periodogram(times, values, None, grid)
+        self.assertAlmostEqual(res.sse, min(single.sses), places=12)
+        # no pair can beat a single: models were still all enumerated
+        self.assertEqual(res.models_evaluated, 3 + 3)
+
+
+class TestJointFitValidation(unittest.TestCase):
+
+    def _good(self, **over):
+        kw = dict(
+            times=[0.0, 1.0, 2.0, 3.0, 4.0],
+            values=[0.1, 0.9, 1.1, 2.0, 0.4],
+            weights=None,
+            frequencies=[0.2, 0.5, 0.8],
+        )
+        kw.update(over)
+        return kw
+
+    def assertBad(self, needle, **over):
+        with self.assertRaises(PeriodogramError) as ctx:
+            joint_periodogram_fit(**self._good(**over))
+        self.assertIn(needle, str(ctx.exception))
+
+    def test_max_frequencies_rules(self):
+        self.assertBad("max_frequencies", max_frequencies=0)
+        self.assertBad("max_frequencies", max_frequencies=3)
+        self.assertBad("max_frequencies", max_frequencies=True)
+        self.assertBad("max_frequencies", max_frequencies=1.5)
+        self.assertBad("max_frequencies", max_frequencies="2")
+
+    def test_grid_size_capped_at_twelve(self):
+        self.assertBad("candidates",
+                       frequencies=[0.1 * j for j in range(1, 14)])
+        self.assertBad("candidates", frequencies=[])
+        # exactly 12 is admitted
+        res = joint_periodogram_fit(
+            **self._good(frequencies=[0.1 * j for j in range(1, 13)])
+        )
+        self.assertEqual(res.models_evaluated, 12 + 12 * 11 // 2)
+
+    def test_grid_must_be_strictly_increasing_positive(self):
+        self.assertBad("strictly increasing",
+                       frequencies=[0.2, 0.5, 0.5])
+        self.assertBad("strictly increasing",
+                       frequencies=[0.8, 0.5, 0.2])
+        self.assertBad("frequencies[0]", frequencies=[0.0, 0.5, 0.8])
+        self.assertBad("frequencies[1]", frequencies=[0.5, -0.2, 0.8])
+        self.assertBad("frequencies[2]",
+                       frequencies=[0.2, 0.5, float("nan")])
+
+    def test_array_value_and_weight_checks(self):
+        self.assertBad("times[1]",
+                       times=[0.0, float("nan"), 2.0, 3.0, 4.0])
+        self.assertBad("values[0]",
+                       values=[float("inf"), 0.9, 1.1, 2.0, 0.4])
+        self.assertBad("weights[1]",
+                       weights=[1.0, 0.0, 2.0, 1.0, 1.0])
+        self.assertBad("weights[2]",
+                       weights=[1.0, 1.0, -0.5, 1.0, 1.0])
+        self.assertBad("values", values=[0.1, 0.9, 1.1])
+        self.assertBad("observations",
+                       times=[0.0, 1.0], values=[0.0, 1.0],
+                       frequencies=[0.5])
+
+    def test_rank_tol_range_and_bool_elements(self):
+        self.assertBad("rank_tol", rank_tol=0.0)
+        self.assertBad("rank_tol", rank_tol=1.0)
+        self.assertBad("times[0]", times=[True, 1.0, 2.0, 3.0, 4.0])
+
+    def test_type_errors_localizable(self):
+        self.assertBad("times", times=(0.0, 1.0, 2.0, 3.0, object()))
+        self.assertBad("frequencies", frequencies="0.2 0.5 0.8")
+        # plain integer elements are real numbers and stay accepted
+        res = joint_periodogram_fit(
+            **self._good(times=[0, 1, 2, 3, 4], weights=[1, 1, 1, 1, 1])
+        )
+        self.assertEqual(res.order >= 1, True)
+
+    def test_inputs_are_not_mutated(self):
+        times = [3.0, 1.0, 0.0, 2.0, 4.0]  # unsorted on purpose
+        values = [0.1, 0.9, 1.1, 2.0, 0.4]
+        weights = [1.0, 2.0, 1.0, 0.5, 1.5]
+        grid = [0.8, 0.2, 0.5]  # invalid order -> must raise, inputs untouched
+        t_copy, v_copy, w_copy = (times[:], values[:], weights[:])
+        with self.assertRaises(PeriodogramError):
+            joint_periodogram_fit(times, values, weights, grid)
+        self.assertEqual(times, t_copy)
+        self.assertEqual(values, v_copy)
+        self.assertEqual(weights, w_copy)
+        # a successful call likewise leaves inputs untouched
+        good_grid = [0.2, 0.5, 0.8]
+        joint_periodogram_fit(times, values, weights, good_grid)
+        self.assertEqual(times, t_copy)
+        self.assertEqual(values, v_copy)
+        self.assertEqual(weights, w_copy)
+
+    def test_result_is_immutable_value_object(self):
+        res = joint_periodogram_fit(**self._good())
+        with self.assertRaises(Exception):
+            res.frequencies = (1.0,)  # type: ignore[misc]
 
 
 if __name__ == "__main__":

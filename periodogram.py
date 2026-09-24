@@ -12,6 +12,11 @@ model, ``P = (SSE0 - SSE(f)) / SSE0``.
 The sampling window ``W(f) = sum_k w_k * exp(i*2*pi*f*t_k)`` is also computed;
 its modulus normalized by ``sum w_k`` explains alias structure.
 
+``joint_periodogram_fit`` enumerates every 1- or 2-frequency subset of a
+finite candidate grid (<= 12 points), fits the joint model through the same
+weighted QR entry, and selects the subset with smallest weighted SSE
+(frequency lexicographic order on exact ties).
+
 Standard library only (Python 3.14.7).  See README.md for the full contract,
 numerical error budget and known limitations.
 """
@@ -25,23 +30,31 @@ from numbers import Real
 
 __all__ = [
     "periodogram",
+    "joint_periodogram_fit",
     "PeriodogramResult",
     "FrequencyPeak",
+    "JointFrequencyFit",
     "PeriodogramError",
     "EPS",
     "MAX_OBSERVATIONS",
     "MAX_FREQUENCIES",
     "MIN_OBSERVATIONS",
+    "MAX_JOINT_CANDIDATES",
+    "MAX_JOINT_ORDER",
 ]
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 # machine epsilon of binary64 (Python floats are IEEE-754 binary64)
 EPS = 2.220446049250313e-16
 
 MAX_OBSERVATIONS = 200
 MAX_FREQUENCIES = 300
-MIN_OBSERVATIONS = 3  # the model has three parameters (c, a, b)
+MIN_OBSERVATIONS = 3  # the smallest model has three parameters (c, a, b)
+# Joint multi-frequency enumeration: at most two frequencies, chosen from a
+# finite candidate grid of at most 12 points (<= 66 pair models).
+MAX_JOINT_CANDIDATES = 12
+MAX_JOINT_ORDER = 2
 
 _TWO_PI = 2.0 * math.pi
 
@@ -67,6 +80,40 @@ class FrequencyPeak:
     rank: int             # numerical rank of the weighted 3-column design
     sse: float            # weighted residual SSE at this frequency
     window_modulus: float  # |sum w exp(i2pi f t)| / sum w
+
+
+@dataclass(frozen=True)
+class JointFrequencyComponent:
+    """One sinusoidal component of a joint multi-frequency fit."""
+
+    frequency: float       # candidate-grid value, ascending within a fit
+    amplitude: float       # hypot(a, b) of this component
+    phase: float           # atan2(b, a) in radians, wrapped to (-pi, pi]
+    cos_coefficient: float  # a in the ORIGINAL time frame
+    sin_coefficient: float  # b in the ORIGINAL time frame
+
+
+@dataclass(frozen=True)
+class JointFrequencyFit:
+    """Best 1- or 2-frequency joint model found by finite-grid enumeration.
+
+    The winner minimizes the weighted residual SSE over every admissible
+    subset of ``1..max_frequencies`` grid points (ties broken by ascending
+    frequency lexicographic order); its linear coefficients are the exact
+    weighted least-squares solution of the joint design.
+    """
+
+    frequencies: tuple[float, ...]            # ascending, length 1 or 2
+    components: tuple[JointFrequencyComponent, ...]  # same order
+    constant: float                           # fitted floating mean c
+    sse: float                                # weighted residual SSE
+    sse0: float                               # weighted SSE of constant model
+    power: float                              # (SSE0 - SSE) / SSE0
+    rank: int                                 # numerical rank of the design
+    order: int                                # number of frequencies (1 or 2)
+    models_evaluated: int                     # subset models actually fitted
+    rank_tol: float
+    weighted_mean: float                      # constant-model fit
 
 
 @dataclass(frozen=True)
@@ -488,4 +535,221 @@ def _peak(i, f, powers, amplitudes, phases, ranks, sses, window_mod) -> Frequenc
         rank=ranks[i],
         sse=sses[i],
         window_modulus=window_mod[i],
+    )
+
+
+# --------------------------------------------------------------------------- #
+# joint multi-frequency enumeration (1 or 2 frequencies, <= 12 grid points)
+# --------------------------------------------------------------------------- #
+def _rotate_to_original(a_tau: float, b_tau: float, freq: float,
+                        t0: float) -> tuple[float, float]:
+    """Rotate (a, b) from the tau = t - t0 frame back into the t frame."""
+    theta = _TWO_PI * freq * t0
+    ct, st = math.cos(theta), math.sin(theta)
+    return a_tau * ct - b_tau * st, a_tau * st + b_tau * ct
+
+
+def joint_periodogram_fit(
+    times,
+    values,
+    weights,
+    frequencies,
+    *,
+    max_frequencies: int = 2,
+    rank_tol: float | None = None,
+) -> JointFrequencyFit:
+    """Enumerate joint sinusoidal fits over a finite frequency grid.
+
+    For every non-empty subset of 1..``max_frequencies`` *distinct* candidate
+    grid points, the joint floating-mean model is fitted by the SAME weighted
+    Householder QR least-squares entry used by :func:`periodogram` (linear
+    coefficients are exact least squares, never coordinate descent):
+
+        y ~= c + sum_j (a_j cos(2*pi*f_j*t) + b_j sin(2*pi*f_j*t))
+
+    The winning subset minimizes the weighted residual SSE; exact SSE ties
+    resolve by ascending frequency lexicographic order (the one-frequency
+    model at the smallest frequency precedes every pair).
+
+    Parameters
+    ----------
+    times, values:
+        Lists/tuples of finite real numbers, equal length, 3 <= n <= 200.
+        Times need not be sorted and may repeat.
+    weights:
+        Per-observation strictly positive finite weights, or ``None`` for
+        unit weights.  A global weight rescaling changes nothing.
+    frequencies:
+        Strictly increasing, strictly positive finite candidate frequencies,
+        length 1..12.
+    max_frequencies:
+        1 or 2 (``bool`` rejected).  With 2, all m singles and m*(m-1)/2
+        pairs are fitted.  If fewer than ``max_frequencies`` grid points
+        exist, only the admissible subsets are fitted (reported via
+        ``order`` / ``models_evaluated``).
+    rank_tol:
+        Pivot threshold for numerical rank, ``|R_jj| > rank_tol*max|R_ii|``.
+        Default ``n * EPS``.  Override must lie in (0, 1).  Columns judged
+        null get coefficient zero (e.g. two frequencies that are exact
+        aliases on the sample times yield a rank-deficient joint design).
+
+    Raises
+    ------
+    PeriodogramError
+        For every contract violation; the message names the parameter and
+        element index.  Validation completes before any fit, and the
+        function is pure (inputs are never mutated), so a rejected call
+        leaves no partially updated state.
+    """
+    max_frequencies = _int_param(
+        "max_frequencies", max_frequencies, minimum=1
+    )
+    if max_frequencies > MAX_JOINT_ORDER:
+        raise PeriodogramError(
+            f"max_frequencies: expected <= {MAX_JOINT_ORDER}, got "
+            f"{max_frequencies}"
+        )
+    if rank_tol is not None:
+        rank_tol = _float_param("rank_tol", rank_tol, lower=EPS,
+                                upper=1.0 - EPS)
+
+    t = _real_array("times", times)
+    y = _real_array("values", values)
+    if weights is None:
+        w = [1.0] * len(t)
+    else:
+        w = _real_array("weights", weights, strictly_positive=True)
+    f = _real_array("frequencies", frequencies, strictly_positive=True)
+
+    n, m = len(t), len(f)
+    if not (MIN_OBSERVATIONS <= n <= MAX_OBSERVATIONS):
+        raise PeriodogramError(
+            f"times: expected between {MIN_OBSERVATIONS} and {MAX_OBSERVATIONS} "
+            f"observations, got {n}"
+        )
+    if len(y) != n:
+        raise PeriodogramError(
+            f"values: length {len(y)} does not match times length {n}"
+        )
+    if len(w) != n:
+        raise PeriodogramError(
+            f"weights: length {len(w)} does not match times length {n}"
+        )
+    if not (1 <= m <= MAX_JOINT_CANDIDATES):
+        raise PeriodogramError(
+            f"frequencies: expected between 1 and {MAX_JOINT_CANDIDATES} "
+            f"joint-fit candidates, got {m}"
+        )
+    for i in range(1, m):
+        if not (f[i] > f[i - 1]):
+            raise PeriodogramError(
+                f"frequencies[{i}]: candidates must be strictly increasing; "
+                f"{f[i]} follows {f[i - 1]}"
+            )
+    if rank_tol is None:
+        rank_tol = n * EPS
+
+    t0 = t[0]
+    tau = [tk - t0 for tk in t]
+    sqrt_w = [math.sqrt(wk) for wk in w]
+
+    # ----- constant model (same floating-mean reference as periodogram) ----
+    ones = [[1.0] for _ in range(n)]
+    r0, b0, _ = _weighted_qr(ones, y, sqrt_w, 1)
+    constant_data = all(v == y[0] for v in y)
+    weighted_mean = float(y[0]) if constant_data else b0[0] / r0[0][0]
+    sse0 = 0.0 if constant_data else sum(z * z for z in b0[1:])
+
+    def fit_subset(idx: tuple[int, ...]):
+        """Weighted LS for one joint model via the shared QR entry point."""
+        k = len(idx)
+        ncols = 1 + 2 * k
+        rows: list[list[float]] = [[0.0] * ncols for _ in range(n)]
+        for i in range(n):
+            rows[i][0] = 1.0
+        for j, gi in enumerate(idx):
+            freq = f[gi]
+            ccol, scol = 2 * j + 1, 2 * j + 2
+            for i in range(n):
+                angle = _TWO_PI * freq * tau[i]
+                rows[i][ccol] = math.cos(angle)
+                rows[i][scol] = math.sin(angle)
+        r, qb, pivots = _weighted_qr(rows, y, sqrt_w, ncols)
+        coef, rank = _solve_triangular(r, qb, pivots, rank_tol)
+        # Residual from the fitted projection: unambiguous for any rank
+        # (residual energy in skipped null columns is not lost, see the
+        # periodogram design notes).
+        sse = 0.0
+        for i in range(n):
+            fit = coef[0]
+            for j in range(k):
+                fit += coef[2 * j + 1] * rows[i][2 * j + 1]
+                fit += coef[2 * j + 2] * rows[i][2 * j + 2]
+            d = y[i] - fit
+            sse += w[i] * d * d
+        return sse, coef, rank
+
+    # Canonical enumeration order is already frequency-lexicographic:
+    # singles f[0], f[1], ... then pairs (0,1),(0,2),...,(1,2),...; the
+    # explicit key makes the (SSE, frequency) tie-break self-documenting.
+    candidates: list[tuple[int, ...]] = [(i,) for i in range(m)]
+    if max_frequencies >= 2:
+        candidates.extend(
+            (i, j) for i in range(m) for j in range(i + 1, m)
+        )
+
+    best_key: tuple[float, tuple[float, ...]] | None = None
+    best_idx: tuple[int, ...] = ()
+    best_coef: list[float] = []
+    best_sse = math.inf
+    best_rank = 0
+    first_single: tuple[list[float], int] | None = None
+    for idx in candidates:
+        sse, coef, rank = fit_subset(idx)
+        if idx == (0,):
+            first_single = (coef, rank)
+        key = (sse, tuple(f[g] for g in idx))
+        if best_key is None or key < best_key:
+            best_key, best_idx = key, idx
+            best_sse, best_coef, best_rank = sse, coef, rank
+
+    if constant_data:
+        # Bitwise-constant data: every model has mathematically zero SSE, so
+        # under the (SSE, lexicographic-frequency) rule the winner is the
+        # single smallest candidate.  Roundoff residuals (~1e-30) must not
+        # pick an arbitrary pair; reuse that already-fitted single's rank.
+        best_idx = (0,)
+        best_sse = 0.0
+        best_coef = [float(y[0]), 0.0, 0.0]
+        best_rank = first_single[1]
+
+    components: list[JointFrequencyComponent] = []
+    for j, gi in enumerate(best_idx):
+        freq = f[gi]
+        a_tau, b_tau = best_coef[2 * j + 1], best_coef[2 * j + 2]
+        a_fit, b_fit = _rotate_to_original(a_tau, b_tau, freq, t0)
+        components.append(
+            JointFrequencyComponent(
+                frequency=freq,
+                amplitude=math.hypot(a_fit, b_fit),
+                phase=math.atan2(b_fit, a_fit),
+                cos_coefficient=a_fit,
+                sin_coefficient=b_fit,
+            )
+        )
+
+    power = 0.0 if constant_data else (sse0 - best_sse) / sse0
+
+    return JointFrequencyFit(
+        frequencies=tuple(f[g] for g in best_idx),
+        components=tuple(components),
+        constant=best_coef[0],
+        sse=best_sse,
+        sse0=sse0,
+        power=power,
+        rank=best_rank,
+        order=len(best_idx),
+        models_evaluated=len(candidates),
+        rank_tol=rank_tol,
+        weighted_mean=weighted_mean,
     )

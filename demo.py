@@ -7,7 +7,11 @@ The script performs real computation (no sleeps, no pre-recorded results):
 1. normal result  -- a deterministic unevenly sampled light curve with a
    nightly observing cadence produces a genuine double-peak alias
    ambiguity (true f0 and f0 +/- 1/day); the sampling window explains it;
-2. rejection path -- a NaN observation is actually rejected with a
+2. fixed nuisance design H -- a linear drift plus a weak sinusoid is fit
+   with H=[1,t]; the power is relative to the H-only baseline, and the
+   near-zero-frequency bins that are collinear with the drift are marked
+   unestimable individually while a rank-deficient H is rejected wholesale;
+3. rejection path -- a NaN observation is actually rejected with a
    locatable PeriodogramError (plus a bool-as-int parameter rejection).
 """
 
@@ -149,6 +153,55 @@ def main():
     )
     print(f"  double-peak ambiguity present: {ambiguity} "
           f"(f0 and f0 +/- 1/day are nearly equally supported)")
+
+    # -------- fixed nuisance design matrix H (trend projection) -----------
+    print("-" * 72)
+    print("fixed design matrix H=[1, t]: linear drift projected out first")
+    n = 32
+    t_drift = [0.11 * k + 0.03 * ((k * 5) % 4) for k in range(n)]
+    f_d, amp_d, c_d, slope_d = 0.53, 0.40, 0.20, 2.5
+    y_drift = [
+        c_d + slope_d * t
+        + amp_d * math.sin(TWO_PI * f_d * t)
+        + 0.01 * (rnd_v - 0.5)
+        for t, rnd_v in zip(t_drift, lcg(77, n))
+    ]
+    w_drift = [1e-5 if k % 2 else 1e5 for k in range(n)]
+    H = [[1.0, t] for t in t_drift]
+    f_grid_d = [0.02 * j for j in range(1, 45)] + [1e-11, 1e-9]
+    f_grid_d = sorted(set(f_grid_d))
+    rd = periodogram(t_drift, y_drift, w_drift, f_grid_d, H=H,
+                     top_k=3, min_separation=0.3)
+    rc = periodogram(t_drift, y_drift, w_drift, f_grid_d)
+    print(f"  H-only baseline SSE : {rd.sse0:.4e}")
+    print(f"  constant-only SSE   : {rc.sse0:.4e} (power denominator "
+          f"WITHOUT H)")
+    jd = max(
+        (i for i, s in enumerate(rd.statuses) if s == "ok"),
+        key=lambda i: rd.powers[i],
+    )
+    print(f"  strongest H-relative bin: f={f_grid_d[jd]:.3f}/day "
+          f"P_H={rd.powers[jd]:.6f} A={rd.amplitudes[jd]:.4f} "
+          f"drift={rd.h_coefficients[jd][1]:+.4f} (injected {slope_d:+.2f})")
+    print(f"  same bin against constant denominator: "
+          f"P_const={rc.powers[jd]:.6f} -- the drift would mask the signal")
+    unest = [f for f, s in zip(f_grid_d, rd.statuses)
+             if s == "unestimable"]
+    print(f"  individually unestimable bins (cos/sin rank lost against H): "
+          f"{[f'{x:.0e}' for x in unest]}")
+    # exact-fit baseline -> undefined power, not 0 or 1
+    y_exact = [1.0 - 0.3 * t for t in t_drift]
+    ru = periodogram(t_drift, y_exact, None, [0.3, 0.6], H=H)
+    print(f"  zero-baseline SSE ({ru.sse0:.2e}): statuses={ru.statuses}, "
+          f"powers are NaN: {[math.isnan(p) for p in ru.powers]}")
+    # rank-deficient H rejected for the whole call
+    try:
+        periodogram(t_drift, y_drift, None, [0.3],
+                    H=[[1.0, 2.0] for _ in t_drift])
+    except PeriodogramError as exc:
+        print(f"  rank-deficient H rejected wholesale: {exc}")
+    else:
+        raise SystemExit("FAIL: rank-deficient H was not rejected")
 
     # ------------------- actually triggered rejection path ------------------
     print("-" * 72)

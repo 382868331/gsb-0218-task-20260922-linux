@@ -360,12 +360,20 @@ class TestTimeOriginAndDegenerateSampling(unittest.TestCase):
         freqs = [0.25, 0.5, 0.75]
         res = periodogram(times, values, weights, freqs)
         for i, freq in enumerate(freqs):
+            # repeated instants make cos and sin take identical values on
+            # the paired rows; with the default ones column the design can
+            # still be full rank unless a trig column collapses.  Compare
+            # every bin against the independent reference when estimable,
+            # otherwise require the explicit status instead of a power.
             _, _, _, sse, sse0, _ = normal_equation_reference(
                 times, values, weights, freq
             )
             self.assertAlmostEqual(res.sses[i], sse, places=10)
-            self.assertAlmostEqual(res.powers[i], (sse0 - sse) / sse0,
-                                   places=10)
+            if res.statuses[i] == "unestimable":
+                self.assertTrue(math.isnan(res.powers[i]))
+            else:
+                self.assertAlmostEqual(res.powers[i], (sse0 - sse) / sse0,
+                                       places=10)
 
     def test_rank_deficiency_when_sampling_cannot_identify(self):
         # all observations at a single instant: cos column collinear with ones
@@ -373,9 +381,13 @@ class TestTimeOriginAndDegenerateSampling(unittest.TestCase):
         values = [1.0, 2.0, 0.5, 1.2]
         res = periodogram(times, values, None, [0.1, 0.2, 0.3])
         self.assertTrue(all(rank <= 2 for rank in res.ranks))
-        # constant model is the best achievable; power is 0
-        for p in res.powers:
-            self.assertAlmostEqual(p, 0.0, places=12)
+        # with all samples at one instant both trig columns are collinear
+        # with the constant: every bin is explicitly unestimable rather
+        # than carrying a fabricated power
+        self.assertTrue(
+            all(s == "unestimable" for s in res.statuses)
+        )
+        self.assertTrue(all(math.isnan(p) for p in res.powers))
 
 
 class TestConstantAndAlias(unittest.TestCase):
@@ -601,6 +613,244 @@ class TestInputValidation(unittest.TestCase):
         self.assertEqual(len(res.frequencies), len(res.window))
         with self.assertRaises(Exception):
             res.powers = ()  # type: ignore[misc]
+
+
+class TestNuisanceDesignMatrix(unittest.TestCase):
+    """Caller-supplied fixed H: [H, cos, sin] fits with relative power.
+
+    The independent reference builds the FULL design matrix from scratch and
+    solves the weighted normal equations by Gaussian elimination with
+    partial pivoting -- a deliberately different algorithm from the
+    production QR -- and independently constructs the H-only baseline.
+    """
+
+    def gaussian_full(self, A, b, weights):
+        """Weighted least squares on an arbitrary-column design matrix A."""
+        nrows = len(A)
+        q = len(A[0])
+        mat = [
+            [sum(weights[k] * A[k][i] * A[k][j] for k in range(nrows))
+             for j in range(q)]
+            for i in range(q)
+        ]
+        rhs = [sum(weights[k] * b[k] * A[k][i] for k in range(nrows))
+               for i in range(q)]
+        M = [mat[i][:] + [rhs[i]] for i in range(q)]
+        scale = max((abs(M[i][j]) for i in range(q) for j in range(q)),
+                    default=1.0)
+        for c in range(q):
+            piv = max(range(c, q), key=lambda rr: abs(M[rr][c]))
+            if abs(M[piv][c]) < 1e-14 * max(scale, 1.0):
+                return None
+            M[c], M[piv] = M[piv], M[c]
+            for rr in range(c + 1, q):
+                f = M[rr][c] / M[c][c]
+                for cc in range(c, q + 1):
+                    M[rr][cc] -= f * M[c][cc]
+        x = [0.0] * q
+        for rr in range(q - 1, -1, -1):
+            x[rr] = (
+                M[rr][q] - sum(M[rr][cc] * x[cc]
+                               for cc in range(rr + 1, q))
+            ) / M[rr][rr]
+        return x
+
+    def sse_of(self, A, x, b, weights):
+        return sum(
+            weights[k]
+            * (b[k] - sum(x[j] * A[k][j] for j in range(len(A[0])))) ** 2
+            for k in range(len(A))
+        )
+
+    def test_trend_plus_signal_wide_weights_matches_independent_ls(self):
+        # trend (constant + linear drift) plus a single sinusoid, uneven
+        # times and weights spanning 12 orders of magnitude
+        n = 30
+        times = [0.13 * k + 0.05 * ((k * 7) % 3) for k in range(n)]
+        f0, amp0, delta0 = 0.47, 1.6, -0.4
+        c0, slope0 = 0.8, 0.09
+        values = [
+            c0 + slope0 * t
+            + amp0 * math.cos(TWO_PI * f0 * t + delta0)
+            for t in times
+        ]
+        weights = [1e-6 if k % 2 == 0 else 1e6 for k in range(n)]
+        H = [[1.0, t] for t in times]
+        freqs = [0.2 + 0.03 * j for j in range(20)]
+
+        res = periodogram(times, values, weights, freqs, H=H)
+        self.assertEqual(res.h_columns, 2)
+        self.assertEqual(res.constant_column, 0)
+        self.assertEqual(res.h_rank, 2)
+
+        # independent H-only baseline
+        x_h = self.gaussian_full(H, values, weights)
+        sse_h = self.sse_of(H, x_h, values, weights)
+        self.assertAlmostEqual(res.sse0, sse_h, delta=1e-10 * max(1.0, sse_h))
+        # the H-only baseline absorbs some sinusoidal leakage into its drift
+        # coefficient, so it need not equal slope0; it only has to match
+        # the independent H-only Gaussian solve
+        self.assertAlmostEqual(res.h_baseline_coefficients[0], x_h[0],
+                               places=9)
+        self.assertAlmostEqual(res.h_baseline_coefficients[1], x_h[1],
+                               places=9)
+
+        for i, fr in enumerate(freqs):
+            self.assertEqual(res.statuses[i], "ok")
+            A = [
+                [1.0, times[k],
+                 math.cos(TWO_PI * fr * times[k]),
+                 math.sin(TWO_PI * fr * times[k])]
+                for k in range(n)
+            ]
+            x = self.gaussian_full(A, values, weights)
+            sse = self.sse_of(A, x, values, weights)
+            self.assertAlmostEqual(
+                res.sses[i], sse, delta=1e-9 * max(1.0, sse)
+            )
+            # power denominator is the H-ONLY SSE, not a constant SSE
+            self.assertAlmostEqual(res.powers[i], (sse_h - sse) / sse_h,
+                                   places=9)
+            self.assertAlmostEqual(res.h_coefficients[i][1], x[1],
+                                   delta=1e-9 * max(1.0, abs(x[1])))
+            self.assertEqual(res.ranks[i], 4)
+
+        # signal bin identified with unit power and recovered parameters
+        j = freqs.index(0.47000000000000003)
+        self.assertGreater(res.powers[j], 1.0 - 1e-9)
+        self.assertAlmostEqual(res.amplitudes[j], amp0, places=9)
+        # data term is cos(2 pi f t + delta0) = cos(2 pi f t - (-delta0));
+        # production phase = atan2(b, a) = -delta0
+        self.assertAlmostEqual(res.phases[j], -delta0, places=9)
+        best = max(
+            range(len(freqs)),
+            key=lambda i: res.powers[i]
+            if res.statuses[i] == "ok" else -1.0,
+        )
+        self.assertEqual(best, j)
+
+    def test_power_denominator_is_H_baseline_not_constant(self):
+        # The same sinusoid on top of a strong linear drift: relative to the
+        # CONSTANT model the drift would dominate the power denominator, but
+        # with H=[1,t] the baseline already absorbs it.
+        n = 40
+        times = [0.1 * k for k in range(n)]
+        f0, amp0 = 0.2, 0.5
+        slope0 = 3.0
+        values = [slope0 * t + amp0 * math.sin(TWO_PI * f0 * t)
+                  for t in times]
+        H = [[1.0, t] for t in times]
+        res_h = periodogram(times, values, None, [f0], H=H)
+        res_c = periodogram(times, values, None, [f0])
+        # constant-only baseline SSE is huge; H-only baseline is tiny
+        _, _, _, _, sse_const, _ = normal_equation_reference(
+            times, values, [1.0] * n, f0
+        )
+        self.assertGreater(sse_const, res_h.sse0 * 100)
+        self.assertGreater(res_h.powers[0], 1.0 - 1e-9)
+        self.assertLess(res_c.powers[0], res_h.powers[0])
+
+    def test_rank_deficient_H_rejected_for_whole_call(self):
+        n = 20
+        times = [0.1 * k for k in range(n)]
+        values = [0.3 * k for k in range(n)]
+        # second column exactly twice the constant -> H rank 1 < 2
+        H = [[1.0, 2.0] for _ in times]
+        with self.assertRaises(PeriodogramError) as ctx:
+            periodogram(times, values, None, [0.2, 0.5], H=H)
+        self.assertIn("H: rank deficient", str(ctx.exception))
+        # a near-duplicate (but independent) column is accepted
+        H2 = [[1.0, 2.0 + 1e-9 * k] for k in range(n)]
+        with self.assertRaises(PeriodogramError):
+            periodogram(times, values, None, [0.2, 0.5], H=H2,
+                        rank_tol=1e-6)
+
+    def test_zero_baseline_sse_is_undefined_not_zero_or_one(self):
+        n = 20
+        times = [0.1 * k for k in range(n)]
+        values = [1.5 - 0.7 * t for t in times]  # exactly in span(H)
+        H = [[1.0, t] for t in times]
+        res = periodogram(times, values, None, [0.3, 0.5, 0.8], H=H)
+        self.assertTrue(all(s == "undefined_baseline"
+                            for s in res.statuses))
+        self.assertTrue(all(math.isnan(p) for p in res.powers))
+        # no peaks can be selected from undefined bins, but the call is a
+        # valid completed scan rather than an exception
+        self.assertEqual(res.local_peaks, ())
+        self.assertEqual(res.top_peaks, ())
+        self.assertEqual(res.selection_status, "complete")
+
+    def test_low_frequency_near_drift_is_unestimable_per_bin_only(self):
+        n = 24
+        times = [0.1 * k for k in range(n)]
+        values = [0.4 * t + math.cos(TWO_PI * 0.4 * t) for t in times]
+        H = [[1.0, t] for t in times]
+        freqs = [1e-12, 1e-10, 0.4]  # first two ~ collinear with t column
+        res = periodogram(times, values, None, freqs, H=H)
+        self.assertEqual(res.statuses[0], "unestimable")
+        self.assertEqual(res.statuses[1], "unestimable")
+        self.assertEqual(res.statuses[2], "ok")
+        # ranks: H alone contributes 2; trig columns add 0/0/2
+        self.assertEqual(res.ranks[0], 2)
+        self.assertEqual(res.ranks[1], 2)
+        self.assertEqual(res.ranks[2], 4)
+        self.assertTrue(math.isnan(res.powers[0]))
+        # only the estimable bin participates in peak selection
+        self.assertEqual(
+            [p.frequency for p in res.top_peaks], [0.4]
+        )
+
+    def test_H_validation_contract(self):
+        n = 10
+        times = [float(k) for k in range(n)]
+        values = [0.1 * k for k in range(n)]
+        freqs = [0.2, 0.5]
+
+        def call(H, **kw):
+            return periodogram(times, values, None, freqs, H=H, **kw)
+
+        with self.assertRaises(PeriodogramError) as c:
+            call([[1.0]] * (n - 1))
+        self.assertIn("H: expected", str(c.exception))
+        # a constant-free matrix (single non-ones column)
+        with self.assertRaises(PeriodogramError) as c:
+            call([[t] for t in times])
+        self.assertIn("constant", str(c.exception))
+        # duplicate constant columns rejected
+        with self.assertRaises(PeriodogramError) as c:
+            call([[1.0, 1.0] for _ in times])
+        self.assertIn("exactly one constant", str(c.exception))
+        # bool / NaN elements localized
+        with self.assertRaises(PeriodogramError) as c:
+            call([[1.0, True if k == 3 else float(k)] for k in range(n)])
+        self.assertIn("H[3][1]", str(c.exception))
+        bad = [[1.0, float(k)] for k in range(n)]
+        bad[2][1] = float("nan")
+        with self.assertRaises(PeriodogramError) as c:
+            call(bad)
+        self.assertIn("H[2][1]", str(c.exception))
+        # ragged rows
+        with self.assertRaises(PeriodogramError) as c:
+            call([[1.0, 0.0]] * (n - 1) + [[1.0]])
+        self.assertIn("H[9]", str(c.exception))
+        # too few observations for H + sin + cos
+        with self.assertRaises(PeriodogramError) as c:
+            periodogram([0.0, 1.0, 2.0], [0.1, 0.2, 0.3], None, [0.2],
+                        H=[[1.0, t] for t in range(3)])
+        self.assertIn("H columns + 2", str(c.exception))
+
+    def test_default_H_keeps_original_entry_and_constant_convention(self):
+        n = 20
+        times = sorted(u for u in lcg(11, n))
+        values = [2.0] * n
+        res = periodogram(times, values, [0.5 + u for u in lcg(12, n)],
+                          [0.2 * j for j in range(1, 8)])
+        self.assertEqual(res.h_columns, 1)
+        self.assertEqual(res.constant_column, 0)
+        self.assertTrue(all(p == 0.0 for p in res.powers))
+        self.assertTrue(all(s == "ok" for s in res.statuses))
+        self.assertEqual(res.sse0, 0.0)
+        self.assertAlmostEqual(res.weighted_mean, 2.0, places=14)
 
 
 class TestWindowDirectReference(unittest.TestCase):

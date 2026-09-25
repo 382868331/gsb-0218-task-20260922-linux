@@ -1,13 +1,14 @@
 """Fixed-input demonstration of the floating-mean periodogram module.
 
-Run with:  python demo.py
+Run with:  ./.venv/bin/python demo.py
 
 The script performs real computation (no sleeps, no pre-recorded results):
 
 1. normal result  -- a deterministic unevenly sampled light curve with a
    nightly observing cadence produces a genuine double-peak alias
    ambiguity (true f0 and f0 +/- 1/day); the sampling window explains it;
-2. rejection path -- a NaN observation is actually rejected with a
+2. known-trend H -- a linear drift baseline and explicit rank/power states;
+3. rejection path -- a NaN observation is actually rejected with a
    locatable PeriodogramError (plus a bool-as-int parameter rejection).
 """
 
@@ -63,6 +64,82 @@ def independent_normal_equation_fit(times, values, freq):
         d = y - c - aa * math.cos(phi) - bb * math.sin(phi)
         sse += d * d
     return math.hypot(aa, bb), sse
+
+
+def independent_full_matrix_fit(times, values, weights, freq):
+    """Independent [1, t, cos, sin] weighted normal-equation fit."""
+    rows = []
+    for t in times:
+        phi = TWO_PI * freq * t
+        rows.append((1.0, t, math.cos(phi), math.sin(phi)))
+    k = 4
+    mat = [[0.0] * k for _ in range(k)]
+    vec = [0.0] * k
+    for wt, y, g in zip(weights, values, rows):
+        for i in range(k):
+            vec[i] += wt * y * g[i]
+            for j in range(k):
+                mat[i][j] += wt * g[i] * g[j]
+    for col in range(k):
+        piv = max(range(col, k), key=lambda r: abs(mat[r][col]))
+        mat[col], mat[piv] = mat[piv], mat[col]
+        vec[col], vec[piv] = vec[piv], vec[col]
+        for r in range(col + 1, k):
+            q = mat[r][col] / mat[col][col]
+            for c in range(col, k):
+                mat[r][c] -= q * mat[col][c]
+            vec[r] -= q * vec[col]
+    coef = [0.0] * k
+    for r in range(k - 1, -1, -1):
+        coef[r] = (vec[r] - sum(mat[r][c] * coef[c]
+                                for c in range(r + 1, k))) / mat[r][r]
+    sse = 0.0
+    for wt, y, g in zip(weights, values, rows):
+        d = y - sum(g[i] * coef[i] for i in range(k))
+        sse += wt * d * d
+    return coef, math.hypot(coef[2], coef[3]), sse
+
+
+def h_demo():
+    n = 16
+    times = [0.1 * k + 0.002 * k * k for k in range(n)]
+    weights = [10.0 ** (6.0 * k / (n - 1)) for k in range(n)]
+    intercept, slope = -1.2, 0.55
+    f0, amp, phase = 0.83, 2.0, -0.7
+    values = [
+        intercept + slope * t
+        + amp * math.cos(TWO_PI * f0 * t - phase)
+        for t in times
+    ]
+    H = [[1.0, t] for t in times]
+    frequencies = [1.0e-12, 0.83, 1.27]
+    result = periodogram(times, values, weights, frequencies, H=H,
+                         top_k=1)
+    print("-" * 72)
+    print("known-trend H=[1,t] demonstration (weights span 10^6):")
+    print(f"  baseline: rank={result.h_rank}, SSE_H={result.sse0:.10g}")
+    for item in result.frequency_statuses:
+        if item.status == "ok":
+            print(f"  f={item.frequency:.12g}: status=ok, added_rank="
+                  f"{item.added_rank}, P={item.power:.10f}, "
+                  f"A={item.amplitude:.10f}")
+        else:
+            print(f"  f={item.frequency:.12g}: "
+                  f"status={item.status}, power={item.power}")
+    coef, amp_ref, sse_ref = independent_full_matrix_fit(
+        times, values, weights, f0
+    )
+    peak = result.top_peaks[0]
+    print(f"  independent full [H,cos,sin] check at f={f0:.2f}: "
+          f"A diff={abs(peak.amplitude - amp_ref):.2e}, "
+          f"SSE diff={abs(peak.sse - sse_ref):.2e}")
+    print(f"  baseline trend recovered: intercept={coef[0]:.10f}, "
+          f"slope={coef[1]:.10f}")
+
+    trend_only = [intercept + slope * t for t in times]
+    zero = periodogram(times, trend_only, weights, [f0], H=H)
+    print(f"  zero baseline SSE: status={zero.statuses[0]}, "
+          f"sse0={zero.sse0}, power={zero.powers[0]} (not divided or faked)")
 
 
 def build_alias_dataset():
@@ -149,6 +226,9 @@ def main():
     )
     print(f"  double-peak ambiguity present: {ambiguity} "
           f"(f0 and f0 +/- 1/day are nearly equally supported)")
+
+    # ------------------------- known-trend extension -----------------------
+    h_demo()
 
     # ------------------- actually triggered rejection path ------------------
     print("-" * 72)

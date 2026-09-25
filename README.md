@@ -1,9 +1,10 @@
 # 非均匀采样浮动均值谱估计 / Floating-mean periodogram
 
-面向非均匀采样天文时间序列的可复用周期图模块：在每个候选频率上拟合
-`y = c + a·cos(2πft) + b·sin(2πft)`（常数均值**浮动**，而非先扣除均值），
-采用加权 Householder QR 最小二乘；功率定义为相对常量模型的加权残差平方和
-（SSE）减少比例。另计算采样窗口的归一化模用于解释周期别名。
+面向非均匀采样天文时间序列的可复用周期图模块：调用方可提供固定干扰设计矩阵
+H（必须含常量 1 列，可加入例如线性漂移列 t），在每个候选频率上拟合
+y = Hβ + a·cos(2πft) + b·sin(2πft)。H 先做加权 Householder QR，每个频点的
+sin/cos 列投影到 H 的正交补后再判秩；功率定义为相对只含 H 基准模型的加权 SSE
+减少比例，而不是固定使用常量模型。另计算采样窗口的归一化模用于解释周期别名。
 
 **不使用 FFT、不把不等间隔观测插值/补零成均匀序列**；每个观测就是设计矩阵的
 一行，重复时间、未排序时间均可直接处理。
@@ -16,8 +17,8 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（25 个）
-python demo.py                            # 约 0.1 秒完成真实计算
+./.venv/bin/python -m unittest discover -s tests -v   # 必要测试（29 个）
+./.venv/bin/python demo.py                            # 约 0.1 秒完成真实计算
 ```
 
 两条命令均在本机 Linux 原生验证（见文末“误差口径与验证结果”）。
@@ -29,7 +30,7 @@ from periodogram import periodogram, PeriodogramError, PeriodogramResult
 
 res = periodogram(times, values, weights, frequencies,
                   *, top_k=None, min_separation=0.0,
-                  rank_tol=None, selection_budget=None)
+                  rank_tol=None, selection_budget=None, H=None)
 ```
 
 | 参数 | 契约 |
@@ -42,19 +43,24 @@ res = periodogram(times, values, weights, frequencies,
 | `min_separation` | 非负有限频率排斥距离；已选峰与候选 `|Δf| < min_separation` 时排斥，`|Δf| == min_separation` **允许**（边界内闭） |
 | `rank_tol` | 数值秩阈值，`|R_jj| > rank_tol·max|R_ii|` 判为非零；默认 `n·eps`；可覆盖范围 `(0,1)` |
 | `selection_budget` | top-K 选择时检查的候选数上限；`None` = 全部候选（穷举扫描） |
+| `H` | 可选项；行数等于观测数的嵌套 list/tuple，每行等长且为有限实数。必须有一个位级常量 1 列；可含 t、t² 等固定干扰列。`None` 等价旧接口的常量模型；列数 1..n |
 
 返回不可变值对象 `PeriodogramResult`（逐频率数组 + 峰列表）：
 
 - `frequencies, powers, amplitudes, phases, ranks, constants, sses`：每个候选
-  频率的功率、幅度 `hypot(a,b)`、相位 `atan2(b,a)∈(−π,π]`、设计矩阵数值秩、
-  拟合常数 c、加权 SSE。
-- `sse0`、`weighted_mean`：常量模型 SSE 与加权均值。
+  频率的功率、幅度 `hypot(a,b)`、相位、完整设计矩阵 `[H,cos,sin]` 数值秩、
+  常量列拟合系数、加权 SSE。
+- `statuses`、`frequency_statuses`、`added_ranks`：逐频点状态、幅相/秩/SSE 快照，
+  以及两个频率列在 H 正交补中的新增秩（可估时必须为 2）。
+- `sse0`：只含 H 的基准模型 SSE；`weighted_mean` 始终报告加权样本均值；
+  `h_rank`、`constant_column`、`baseline_coefficients` 报告 H 的秩、常量列下标
+  与基准拟合系数。旧 `H=None` 时基准系数即加权均值。
 - `window`（复数，τ=t−times[0] 参考系）与 `window_modulus`
   `= |Σ w_k exp(i2πft_k)| / Σw_k ∈ [0,1]`；模与时间原点无关，用于别名解释。
 - `local_peaks`：严格局部功率极大（`P[i-1]<P[i]>P[i+1]`，端点永不算峰）。
 - `top_peaks`：按功率降序（功率并列时频率升序）贪心选取，施加显式排斥距离；
   元素为 `FrequencyPeak(index, frequency, power, amplitude, phase, rank, sse,
-  window_modulus)`。
+  window_modulus)`。只有 `status="ok"` 的频点会进入局部峰和 top-K。
 - `selection_status`：
   - `"complete"`：扫描了全部候选；若 `top_k_found < top_k_requested`，
     这是在确定性贪心规则下**可证明无更多可选峰**的结果；
@@ -63,8 +69,18 @@ res = periodogram(times, values, weights, frequencies,
 
 ### 功率定义
 
-`P(f) = (SSE0 − SSE(f)) / SSE0`，其中 `SSE0 = min_c Σw(y−c)²`（浮动均值常量
-模型），`SSE(f)` 为三参数模型的最小二乘残差。普通条件下 `0 ≤ P ≤ 1`。
+`P(f) = (SSE_H − SSE(f)) / SSE_H`，其中 `SSE_H = min_β Σw(y−Hβ)²`，
+`SSE(f)` 为 `[H,cos,sin]` 模型的最小二乘残差。普通条件下 `0 ≤ P ≤ 1`。
+
+### 逐频点状态
+
+- `"ok"`：两个频率列在 H 正交补中新贡献满秩（`added_rank=2`），功率有定义。
+- `"frequency_unestimable"`：频率列投影后新增秩小于 2（例如频率趋近零，cos 与
+  H 的常量/漂移列近共线）。该频点单独标记，不影响其他频点；其功率、幅相、常数
+  系数和 SSE 为 `NaN`。
+- `"zero_baseline_sse"`：基准 H 已零残差解释 y，功率分母为零、数学上未定义；
+  返回该状态且功率为 `NaN`，不除零，也不伪称 0 或 1。
+- H 本身经加权 QR 判定缺秩时无法定义安全基准，整次调用抛 `PeriodogramError`。
 
 ## 错误语义
 
@@ -76,21 +92,22 @@ res = periodogram(times, values, weights, frequencies,
 - 全部输入校验先于任何计算；函数无任何外部可观察的部分变更（纯函数，
   不写文件、不修改入参），不存在“部分完成”状态。
 - 权重必须严格为正（零/负权重直接拒绝，而不是悄悄丢点）。
+- `H` 必须行对齐、每行等长、元素有限，并且包含位级常量 1 列；重复 1 列或其他
+  H 近共线情形由数值秩检测识别，抛出 `H: weighted design is rank deficient ...`。
 
 ## 设计取舍
 
-1. **加权 Householder QR（逐行构造 W^½A，3 列）**：不组正规方程，避免条件数
-   平方化；n≤200、m≤300 下纯 Python 约 0.1 秒。这是本题核心算法，不调用任何
-   第三方谱分析实现。
+1. **H 加权 QR + 频率列增量投影**：H 只分解一次，缓存 Householder 反射并应用到
+   每个频点的 cos/sin；随后只对投影后的两列追加 QR。生产路径不组正规方程，
+   n≤200、m≤300 下纯 Python 约 0.1 秒，不调用任何第三方谱分析实现。
 2. **时间原点重定中心**：内部以 `τ = t − times[0]` 拟合（大原点下保证三角
    参数有界），再用闭式旋转把 (a,b) 转回原时间参考系。功率、幅度、窗口模对
    原点平移在数学上严格不变；`window` 的复相位以 τ 参考系报告。
 3. **SSE 直接按拟合模型残差计算**：当某列被数值秩判定跳过（秩亏）时，
    `Qᵀb` 的残差能量仍分布在被跳过列方向，直接取尾部会漏算；用投影拟合值
    计算对任意秩都无歧义。
-4. **逐位常量值约定**：当所有 `values` 位级相等时，精确返回 `SSE0=0`、
-   每频率 `P=0`、`a=b=0`、`c=该常量`，避免 0/0（这是文档化约定，不是用容差
-   掩盖）。非位级常量的近常量数据照常按浮点计算。
+4. **零基准显式未定义**：当 H 已零残差解释观测时，返回 `zero_baseline_sse` 与
+   `NaN` 功率；不用约定把未定义功率伪装成 0 或 1。
 5. **无插值/无网格/无 FFT**：候选频率由调用方显式给出；模块不假设均匀采样，
    也不做任何零填充。
 6. **采样窗口**：报告 `|W|/Σw` 而非原始复和，天然归一到 `[0,1]` 且对权重
@@ -98,8 +115,8 @@ res = periodogram(times, values, weights, frequencies,
 
 ## 已知限制（本题数学子集，不宣称行业标准兼容）
 
-- 仅实现本题契约：单变量时间、三参数正弦+常量模型、固定候选网格、标量权重；
-  不做多谐波、多信号联合拟合、误差棒传播、显著性/FAP 统计检验、Lomb–Scargle
+- 仅实现本题契约：单变量时间、固定 H + 单频 sin/cos、固定候选网格、标量权重；
+  不做多谐波、多信号联合拟合或双频联合搜索、误差棒传播、显著性/FAP 统计检验、Lomb–Scargle
   标准时移或任何行业标准合规声明。
 - 不做频率精化（抛物线/亚格点拟合）；峰位置精度受候选网格步长限制，
   离线格点的信号会有频谱泄漏（幅度被低估），这是物理效应而非数值缺陷。
@@ -112,7 +129,7 @@ res = periodogram(times, values, weights, frequencies,
 ## 误差口径（README 明确承诺，不用宽容差掩盖边界）
 
 二进制64 浮点，机器精度 `eps = 2.220446049250313e-16`。测试中的独立参考
-（等间隔 DFT 闭式和、3×3 手工加权正规方程高斯消元、窗口直接几何求和）
+（等间隔 DFT 闭式和、手工加权正规方程高斯消元、完整 `[H,cos,sin]` 设计矩阵、窗口直接几何求和）
 **不调用被测核心**产生期望值；与被测代码的往返一致仅作补充检查。
 
 - **等间隔、信号落在 DFT 格点**：残差 SSE `< 1e-24`（相对功率 ≈ 1，
@@ -123,33 +140,39 @@ res = periodogram(times, values, weights, frequencies,
   条件数平方化、约有 1e-10 绝对误差，测试显式以
   `1e-11 + 1e-10·max(1,|x|)` 为界并要求 QR 不劣于参考——该容差是正规方程
   的已知误差界，非掩盖边界错误的“大网”。
+- **固定 H + 大跨度权重**：在权重跨度 1e8 的小例子中，独立构造完整
+  `[1,t,cos,sin]` 矩阵求最小二乘，核对基准 SSE、相对 H 的功率、幅相和斜率；
+  因正规方程在大权重病态参考中有固有误差，幅相测试显式使用相对 1e-7 容差。
 - **大原点平移（1e9）**：两帧各自对照独立参考（参考也在小角度 τ 帧求解）；
   跨帧相位旋转律 `φ₂−φ₁ = 2πfT` 以 `places=5` 检验——该比较中的旋转角
   高达 ~2.4e9 rad，`places=5` 对应约 2e-15 的**相对**精度。输入时间量化
   （≤2·ulp(T)，测试中先实测上界）作为真实输入扰动单独说明。
 - **窗口模**：与直接复数几何求和一致到 `places=12..13`，且 ≤ 1+1e-15。
-- **别名/秩亏/重复时间**：镜像别名两 bin 功率差 `places=12`；秩亏采样
-  功率精确为 0、秩 ≤2；重复时间与独立正规方程一致到 `places=10`。
+- **别名/秩亏/重复时间**：镜像别名两 bin 功率差 `places=12`；频率列投影失秩
+  单独标记 `frequency_unestimable`；重复时间中可估 bin 与独立正规方程核对。
 
 ## 测试与 demo 内容
 
-`tests/test_periodogram.py`（25 个用例）覆盖：
+`tests/test_periodogram.py`（29 个用例）覆盖：
 
 - 等间隔 DFT 解析恢复（格点纯谐波功率=1、闭式 DFT 系数）；
 - 手工加权正规方程独立参考（非均匀时间、非均匀权重、权重全局缩放不变）；
 - 大时间原点平移（两帧对独立参考 + 解析相位旋转律）、重复时间、未排序时间、
   采样秩亏；
-- 常量值（精确零功率约定）、周期镜像别名（`f0` 与 `f_s−f0` 等权，窗口解释）；
+- 常量值/趋势零基准（功率未定义状态）、周期镜像别名（`f0` 与 `f_s−f0` 等权，窗口解释）；
+- 固定趋势 H：线性漂移+单频、频率趋近零近共线、1e8 权重跨度、H 缺秩整次拒绝；
 - 局部峰/端点规则、排斥距离边界内闭、并列确定性、预算耗尽 vs 证明无解；
 - 全部输入校验（NaN/Inf、bool、长度/上限、频率递增与为正、类型可定位错误）。
 
-`python demo.py`（固定输入、确定性、约 0.1 秒，远低于 8 秒预算）：
+`./.venv/bin/python demo.py`（固定输入、确定性、约 0.1 秒，远低于 90 秒预算）：
 
 1. **正常结果**：25 晚 × 3 次的夜间观测节奏、注入 f=1.70/day 信号；
    真实计算出 `1.70 / 0.70 / 2.70` 三峰歧义（P≈0.999 与 0.989），
    采样窗口在 1.00/day 处 |W|/Σw≈0.995 解释周日别名；主峰再用独立
-   3×3 正规方程现场核对（差异 ~1e-16）。
-2. **实际触发的拒绝**：NaN 观测与 `top_k=True` 都真正抛出
+3×3 正规方程现场核对（差异 ~1e-16）。
+2. **H=[1,t] 新能力**：权重跨度 1e6 的线性漂移+单频例子，用完整 4 列正规方程现场核对，
+   并展示近零频 `frequency_unestimable` 与零基准 `zero_baseline_sse`。
+3. **实际触发的拒绝**：NaN 观测与 `top_k=True` 都真正抛出
    `PeriodogramError` 并打印可定位消息（不是预录文本）。
 
 ## 文件
@@ -157,7 +180,7 @@ res = periodogram(times, values, weights, frequencies,
 ```
 periodogram.py             # 核心模块（唯一库文件）
 demo.py                    # 固定输入演示
-tests/test_periodogram.py  # 独立参考 + 25 个 unittest 用例
+tests/test_periodogram.py  # 独立参考 + 29 个 unittest 用例
 README.md
 requirements.txt           # 无第三方依赖（仅注释说明）
 ```

@@ -134,6 +134,42 @@ def direct_window_modulus(times, weights, freq):
     return math.hypot(re, im) / sum(weights)
 
 
+def h_only_sse(values, weights, h_rows, coef):
+    return sum(
+        weights[i] * (values[i] - sum(h_rows[i][j] * coef[j]
+                                     for j in range(len(coef)))) ** 2
+        for i in range(len(values))
+    )
+
+
+def design_lstsq(values, weights, rows):
+    k = len(rows[0])
+    a = [[0.0] * k for _ in range(k)]
+    b = [0.0] * k
+    for i, y in enumerate(values):
+        wt = weights[i]
+        for u in range(k):
+            b[u] += wt * y * rows[i][u]
+            for v in range(k):
+                a[u][v] += wt * rows[i][u] * rows[i][v]
+    for col in range(k):
+        piv = max(range(col, k), key=lambda r: abs(a[r][col]))
+        if abs(a[piv][col]) < 1e-13:
+            raise AssertionError("reference matrix is singular")
+        a[col], a[piv] = a[piv], a[col]
+        b[col], b[piv] = b[piv], b[col]
+        for row in range(col + 1, k):
+            q = a[row][col] / a[col][col]
+            for c in range(col, k):
+                a[row][c] -= q * a[col][c]
+            b[row] -= q * b[col]
+    x = [0.0] * k
+    for row in range(k - 1, -1, -1):
+        x[row] = (b[row] - sum(a[row][c] * x[c]
+                               for c in range(row + 1, k))) / a[row][row]
+    return x
+
+
 # --------------------------------------------------------------------------- #
 # Tests
 # --------------------------------------------------------------------------- #
@@ -252,6 +288,103 @@ class TestNormalEquationReference(unittest.TestCase):
                                    r2.window_modulus[i], places=14)
 
 
+class TestKnownTrendDesign(unittest.TestCase):
+
+    def test_trend_baseline_power_and_coefficients_match_full_design(self):
+        n = 14
+        times = [0.05 * k + 0.003 * (k * k) for k in range(n)]
+        weights = [10.0 ** (8.0 * k / (n - 1)) for k in range(n)]
+        intercept, slope = 1.25, -0.7
+        f0, amp, delta = 0.73, 2.4, 0.9
+        values = [
+            intercept + slope * t
+            + amp * math.cos(TWO_PI * f0 * t - delta)
+            for t in times
+        ]
+        H = [[1.0, t] for t in times]
+        frequencies = [0.11, f0, 1.37]
+        res = periodogram(times, values, weights, frequencies, H=H)
+
+        base_coef = design_lstsq(values, weights, H)
+        sse_base = h_only_sse(values, weights, H, base_coef)
+        self.assertGreater(sse_base, 0.0)
+        self.assertEqual(res.h_rank, 2)
+        self.assertEqual(res.constant_column, 0)
+        self.assertAlmostEqual(res.sse0, sse_base, delta=1e-13 * sse_base)
+        for j, coef in enumerate(base_coef):
+            self.assertAlmostEqual(res.baseline_coefficients[j], coef,
+                                   delta=1e-10 * max(1.0, abs(coef)))
+
+        for i, freq in enumerate(frequencies):
+            full_rows = [
+                H[k] + [math.cos(TWO_PI * freq * t),
+                        math.sin(TWO_PI * freq * t)]
+                for k, t in enumerate(times)
+            ]
+            x = design_lstsq(values, weights, full_rows)
+            sse_ref = h_only_sse(values, weights, full_rows, x)
+            self.assertEqual(res.statuses[i], "ok")
+            self.assertEqual(res.added_ranks[i], 2)
+            self.assertEqual(res.ranks[i], 4)
+            self.assertAlmostEqual(res.sses[i], sse_ref,
+                                   delta=1e-12 * max(1.0, sse_ref))
+            self.assertAlmostEqual(res.powers[i],
+                                   (sse_base - sse_ref) / sse_base,
+                                   places=10)
+            self.assertAlmostEqual(res.amplitudes[i],
+                                   math.hypot(x[2], x[3]),
+                                   delta=1e-7 * max(1.0, math.hypot(x[2], x[3])))
+            self.assertAlmostEqual(
+                wrap_phase(res.phases[i] - math.atan2(x[3], x[2])), 0.0,
+                delta=1e-8,
+            )
+
+    def test_frequency_near_zero_is_separately_marked_unestimable(self):
+        n = 12
+        times = [0.1 * k for k in range(n)]
+        values = [1.0 + 2.0 * t + 0.3 * math.sin(TWO_PI * 0.3 * t)
+                  for t in times]
+        H = [[1.0, t] for t in times]
+        frequencies = [1.0e-13, 0.3]
+        res = periodogram(times, values, None, frequencies, H=H)
+        self.assertEqual(res.statuses[0], "frequency_unestimable")
+        self.assertLess(res.added_ranks[0], 2)
+        self.assertTrue(math.isnan(res.powers[0]))
+        self.assertTrue(math.isnan(res.amplitudes[0]))
+        self.assertTrue(math.isnan(res.sses[0]))
+        self.assertEqual(res.statuses[1], "ok")
+        self.assertEqual(res.added_ranks[1], 2)
+        self.assertFalse(math.isnan(res.powers[1]))
+        self.assertEqual(res.frequency_statuses[0].status,
+                         "frequency_unestimable")
+
+    def test_rank_deficient_or_invalid_H_is_rejected_entire_call(self):
+        times = [0.0, 1.0, 2.0, 3.0]
+        values = [0.1, 0.8, 1.1, 1.7]
+        frequencies = [0.2, 0.5]
+        with self.assertRaisesRegex(PeriodogramError, "H:.*rank deficient"):
+            periodogram(times, values, None, frequencies,
+                        H=[[1.0, 1.0] for _ in times])
+        with self.assertRaisesRegex(PeriodogramError, "H:.*constant"):
+            periodogram(times, values, None, frequencies,
+                        H=[[0.0, t] for t in times])
+        with self.assertRaisesRegex(PeriodogramError, "H:.*degrees of freedom"):
+            periodogram([0.0, 1.0, 2.0], values[:3], None, [0.2],
+                        H=[[1.0, t] for t in [0.0, 1.0, 2.0]])
+
+    def test_zero_baseline_sse_power_is_undefined_not_one(self):
+        n = 10
+        times = [0.2 * k for k in range(n)]
+        intercept, slope = -2.0, 0.375
+        values = [intercept + slope * t for t in times]
+        H = [[1.0, t] for t in times]
+        res = periodogram(times, values, None, [0.25, 0.5], H=H)
+        self.assertEqual(res.sse0, 0.0)
+        self.assertTrue(all(s == "zero_baseline_sse" for s in res.statuses))
+        self.assertTrue(all(math.isnan(p) for p in res.powers))
+        self.assertTrue(all(abs(a) < 1e-12 for a in res.amplitudes))
+
+
 class TestTimeOriginAndDegenerateSampling(unittest.TestCase):
 
     def test_large_origin_shift_invariant_and_phase_rotates(self):
@@ -359,13 +492,20 @@ class TestTimeOriginAndDegenerateSampling(unittest.TestCase):
         weights = [1.0, 0.5, 1.0, 2.0, 0.8, 1.2, 1.0]
         freqs = [0.25, 0.5, 0.75]
         res = periodogram(times, values, weights, freqs)
+        estimable = {0.25: True, 0.5: False, 0.75: True}
         for i, freq in enumerate(freqs):
-            _, _, _, sse, sse0, _ = normal_equation_reference(
-                times, values, weights, freq
-            )
-            self.assertAlmostEqual(res.sses[i], sse, places=10)
-            self.assertAlmostEqual(res.powers[i], (sse0 - sse) / sse0,
-                                   places=10)
+            if estimable[freq]:
+                _, _, _, sse, sse0, _ = normal_equation_reference(
+                    times, values, weights, freq
+                )
+                self.assertEqual(res.statuses[i], "ok")
+                self.assertAlmostEqual(res.sses[i], sse, places=10)
+                self.assertAlmostEqual(res.powers[i], (sse0 - sse) / sse0,
+                                       places=10)
+            else:
+                self.assertEqual(res.statuses[i], "frequency_unestimable")
+                self.assertTrue(math.isnan(res.powers[i]))
+                self.assertTrue(math.isnan(res.sses[i]))
 
     def test_rank_deficiency_when_sampling_cannot_identify(self):
         # all observations at a single instant: cos column collinear with ones
@@ -373,9 +513,8 @@ class TestTimeOriginAndDegenerateSampling(unittest.TestCase):
         values = [1.0, 2.0, 0.5, 1.2]
         res = periodogram(times, values, None, [0.1, 0.2, 0.3])
         self.assertTrue(all(rank <= 2 for rank in res.ranks))
-        # constant model is the best achievable; power is 0
-        for p in res.powers:
-            self.assertAlmostEqual(p, 0.0, places=12)
+        self.assertTrue(all(s == "frequency_unestimable" for s in res.statuses))
+        self.assertTrue(all(math.isnan(p) for p in res.powers))
 
 
 class TestConstantAndAlias(unittest.TestCase):
@@ -387,8 +526,9 @@ class TestConstantAndAlias(unittest.TestCase):
         weights = [0.5 + u for u in lcg(2, n)]
         res = periodogram(times, values, weights, [0.1 * j for j in range(1, 9)])
         self.assertEqual(res.sse0, 0.0)
-        self.assertTrue(all(p == 0.0 for p in res.powers))
-        self.assertTrue(all(a == 0.0 for a in res.amplitudes))
+        self.assertTrue(all(s == "zero_baseline_sse" for s in res.statuses))
+        self.assertTrue(all(math.isnan(p) for p in res.powers))
+        self.assertTrue(all(abs(a) < 1e-12 for a in res.amplitudes))
         self.assertTrue(all(math.isfinite(ph) for ph in res.phases))
         self.assertAlmostEqual(res.weighted_mean, 3.25, places=14)
 

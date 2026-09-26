@@ -25,8 +25,16 @@ from numbers import Real
 
 __all__ = [
     "periodogram",
+    "refine_peak",
+    "single_sine_fit",
+    "single_sine_derivative",
     "PeriodogramResult",
     "FrequencyPeak",
+    "SingleSineFit",
+    "RefinedPeak",
+    "EndpointComparison",
+    "RefinePeakResult",
+    "SingleSineDerivative",
     "PeriodogramError",
     "EPS",
     "MAX_OBSERVATIONS",
@@ -67,6 +75,64 @@ class FrequencyPeak:
     rank: int             # numerical rank of the weighted 3-column design
     sse: float            # weighted residual SSE at this frequency
     window_modulus: float  # |sum w exp(i2pi f t)| / sum w
+
+
+@dataclass(frozen=True)
+class SingleSineFit:
+    """Weighted least-squares fit of the constant-plus-one-sine model."""
+
+    frequency: float
+    constant: float
+    amplitude: float
+    phase: float
+    sse: float
+    rank: int
+
+
+@dataclass(frozen=True)
+class SingleSineDerivative:
+    """Analytic first derivative of the profiled weighted SSE objective."""
+
+    fit: SingleSineFit
+    derivative: float
+
+
+@dataclass(frozen=True)
+class RefinedPeak:
+    """One continuously refined local SSE minimum."""
+
+    frequency: float
+    amplitude: float
+    phase: float
+    constant: float
+    sse: float
+    rank: int
+    segment_index: int
+    evaluations: int
+    stopping_reason: str
+
+
+@dataclass(frozen=True)
+class EndpointComparison:
+    """Best interior fit compared with both closed interval endpoints."""
+
+    left: SingleSineFit | None
+    right: SingleSineFit | None
+    preferred: str  # "left", "right", "refined", "tie", or "none"
+
+
+@dataclass(frozen=True)
+class RefinePeakResult:
+    """Result of a segmented continuous single-sine frequency refinement."""
+
+    best: RefinedPeak | None
+    candidates: tuple[RefinedPeak, ...]
+    endpoints: EndpointComparison
+    scan_frequencies: tuple[float, ...]
+    rank_deficient_frequencies: tuple[float, ...]
+    evaluations: int
+    evaluation_budget: int
+    stopping_reason: str
 
 
 @dataclass(frozen=True)
@@ -238,6 +304,104 @@ def _solve_triangular(
             s -= r[j][k] * x[k]
         x[j] = s / pivots[j]
     return x, rank
+
+
+def _single_sine_fit_prepared(tau, t0, y, w, sqrt_w, freq, rank_tol):
+    """Fit the linear coefficients at one frequency by weighted QR.
+
+    The frequency is the only nonlinear parameter; the constant and the two
+    trigonometric coefficients are eliminated for every objective evaluation.
+    """
+    n = len(tau)
+    rows = [[1.0, 0.0, 0.0] for _ in range(n)]
+    for i in range(n):
+        angle = _TWO_PI * freq * tau[i]
+        rows[i][1] = math.cos(angle)
+        rows[i][2] = math.sin(angle)
+
+    r, qb, pivots = _weighted_qr(rows, y, sqrt_w, 3)
+    coef, rank = _solve_triangular(r, qb, pivots, rank_tol)
+    c_fit, a_tau, b_tau = coef
+    sse = 0.0
+    for i in range(n):
+        resid = y[i] - c_fit - a_tau * rows[i][1] - b_tau * rows[i][2]
+        sse += w[i] * resid * resid
+
+    theta = _TWO_PI * freq * t0
+    ct, st = math.cos(theta), math.sin(theta)
+    a_fit = a_tau * ct - b_tau * st
+    b_fit = a_tau * st + b_tau * ct
+    return SingleSineFit(
+        frequency=freq,
+        constant=c_fit,
+        amplitude=math.hypot(a_fit, b_fit),
+        phase=math.atan2(b_fit, a_fit),
+        sse=sse,
+        rank=rank,
+    )
+
+
+def _validate_series(times, values, weights):
+    t = _real_array("times", times)
+    y = _real_array("values", values)
+    if weights is None:
+        w = [1.0] * len(t)
+    else:
+        w = _real_array("weights", weights, strictly_positive=True)
+    n = len(t)
+    if not (MIN_OBSERVATIONS <= n <= MAX_OBSERVATIONS):
+        raise PeriodogramError(
+            f"times: expected between {MIN_OBSERVATIONS} and {MAX_OBSERVATIONS} "
+            f"observations, got {n}"
+        )
+    if len(y) != n:
+        raise PeriodogramError(
+            f"values: length {len(y)} does not match times length {n}"
+        )
+    if len(w) != n:
+        raise PeriodogramError(
+            f"weights: length {len(w)} does not match times length {n}"
+        )
+    t0 = t[0]
+    tau = [tk - t0 for tk in t]
+    return tau, t0, y, w, [math.sqrt(wk) for wk in w], n
+
+
+def single_sine_fit(times, values, weights, frequency, *, rank_tol=None):
+    """Return the profiled single-sine weighted least-squares fit at frequency."""
+    tau, t0, y, w, sqrt_w, n = _validate_series(times, values, weights)
+    freq = _float_param("frequency", frequency, lower=EPS, upper=None)
+    if rank_tol is None:
+        rank_tol = n * EPS
+    else:
+        rank_tol = _float_param("rank_tol", rank_tol, lower=EPS, upper=1.0 - EPS)
+    return _single_sine_fit_prepared(tau, t0, y, w, sqrt_w, freq, rank_tol)
+
+
+def single_sine_derivative(
+    times, values, weights, frequency, *, rank_tol=None
+) -> SingleSineDerivative:
+    """Return d(SSE)/df after eliminating the linear coefficients at f."""
+    fit = single_sine_fit(
+        times, values, weights, frequency, rank_tol=rank_tol
+    )
+    t = _real_array("times", times)
+    y = _real_array("values", values)
+    if weights is None:
+        w = [1.0] * len(t)
+    else:
+        w = _real_array("weights", weights, strictly_positive=True)
+    derivative = 0.0
+    if fit.rank == 3 and fit.amplitude != 0.0:
+        total = 0.0
+        for tk, yk, wk in zip(t, y, w):
+            angle = _TWO_PI * fit.frequency * tk
+            residual = yk - fit.constant - fit.amplitude * math.cos(
+                angle - fit.phase
+            )
+            total += wk * tk * residual * math.sin(angle - fit.phase)
+        derivative = 2.0 * _TWO_PI * fit.amplitude * total
+    return SingleSineDerivative(fit=fit, derivative=derivative)
 
 
 # --------------------------------------------------------------------------- #
@@ -488,4 +652,243 @@ def _peak(i, f, powers, amplitudes, phases, ranks, sses, window_mod) -> Frequenc
         rank=ranks[i],
         sse=sses[i],
         window_modulus=window_mod[i],
+    )
+
+
+def _refined_from_fit(fit, segment_index, evaluations, reason):
+    return RefinedPeak(
+        frequency=fit.frequency,
+        amplitude=fit.amplitude,
+        phase=fit.phase,
+        constant=fit.constant,
+        sse=fit.sse,
+        rank=fit.rank,
+        segment_index=segment_index,
+        evaluations=evaluations,
+        stopping_reason=reason,
+    )
+
+
+def refine_peak(
+    times,
+    values,
+    weights,
+    frequency_min,
+    frequency_max,
+    *,
+    evaluation_budget: int = 256,
+    scan_points: int = 81,
+    rank_tol: float | None = None,
+) -> RefinePeakResult:
+    """Refine one-sine minima inside a finite closed frequency interval.
+
+    A deterministic dense scan first finds separate local SSE minima.  Each
+    minimum is then refined by a golden-section search on the continuous
+    profiled objective SSE(f); at every tried frequency the constant,
+    cosine and sine coefficients are eliminated by the same weighted QR fit
+    used by periodogram.
+
+    The scan is only a segmentation heuristic.  It never declares a grid
+    point to be the continuous optimum.  With multiple local peaks and a
+    small budget, later segments may remain unrefined, in which case the
+    result reports budget_exhausted instead of a global-optimality claim.
+    """
+    tau, t0, y, w, sqrt_w, n = _validate_series(times, values, weights)
+    f_lo = _float_param("frequency_min", frequency_min, lower=EPS, upper=None)
+    f_hi = _float_param("frequency_max", frequency_max, lower=EPS, upper=None)
+    if f_hi <= f_lo:
+        raise PeriodogramError(
+            "frequency_max: expected a value strictly greater than "
+            f"frequency_min ({f_lo}), got {f_hi}"
+        )
+    evaluation_budget = _int_param(
+        "evaluation_budget", evaluation_budget, minimum=5
+    )
+    scan_points = _int_param("scan_points", scan_points, minimum=5)
+    if rank_tol is None:
+        rank_tol = n * EPS
+    else:
+        rank_tol = _float_param("rank_tol", rank_tol, lower=EPS, upper=1.0 - EPS)
+
+    cache: dict[float, SingleSineFit] = {}
+    rank_bad: list[float] = []
+    evaluations = 0
+    initial_complete = True
+
+    def evaluate(freq):
+        nonlocal evaluations, initial_complete
+        if freq in cache:
+            return cache[freq]
+        if evaluations >= evaluation_budget:
+            initial_complete = False
+            return None
+        fit = _single_sine_fit_prepared(
+            tau, t0, y, w, sqrt_w, freq, rank_tol
+        )
+        evaluations += 1
+        cache[freq] = fit
+        if fit.rank < 3 or not math.isfinite(fit.sse):
+            rank_bad.append(freq)
+        return fit
+
+    point_count = min(scan_points, evaluation_budget)
+    grid: list[float] = []
+    for i in range(point_count):
+        q = 0.0 if point_count == 1 else i / (point_count - 1)
+        freq = f_lo if i == 0 else f_hi if i == point_count - 1 else f_lo + q * (f_hi - f_lo)
+        grid.append(freq)
+        evaluate(freq)
+
+    fits: list[SingleSineFit | None] = [cache.get(freq) for freq in grid]
+    finite_fits = [
+        fit for fit in fits
+        if fit is not None and fit.rank == 3 and math.isfinite(fit.sse)
+    ]
+    left_fit = cache.get(f_lo)
+    right_fit = cache.get(f_hi)
+    left_fit = left_fit if left_fit is not None and left_fit.rank == 3 else None
+    right_fit = right_fit if right_fit is not None and right_fit.rank == 3 else None
+
+    candidates: list[RefinedPeak] = []
+    global_reason = "converged"
+
+    if not finite_fits:
+        global_reason = "rank_deficient"
+    elif not initial_complete:
+        global_reason = "budget_exhausted"
+    else:
+        seeds = []
+        for i in range(1, len(grid) - 1):
+            fit = fits[i]
+            left = fits[i - 1]
+            right = fits[i + 1]
+            if (
+                fit is not None and left is not None and right is not None
+                and fit.rank == left.rank == right.rank == 3
+                and fit.sse < left.sse
+                and fit.sse < right.sse
+            ):
+                seeds.append((i, fit))
+
+        golden_left = (3.0 - math.sqrt(5.0)) * 0.5
+        golden_right = (math.sqrt(5.0) - 1.0) * 0.5
+
+        for seed_i, seed_fit in seeds:
+            lo_freq = grid[seed_i - 1]
+            hi_freq = grid[seed_i + 1]
+            lo_fit = cache[lo_freq]
+            hi_fit = cache[hi_freq]
+            x1_freq = lo_freq + golden_left * (hi_freq - lo_freq)
+            x2_freq = lo_freq + golden_right * (hi_freq - lo_freq)
+            evaluations_start = evaluations
+            x1_fit = evaluate(x1_freq)
+            x2_fit = evaluate(x2_freq)
+            local_used = evaluations - evaluations_start
+            reason = "converged"
+
+            if (
+                x1_fit is None or x2_fit is None
+                or x1_fit.rank < 3 or x2_fit.rank < 3
+                or lo_fit.rank < 3 or hi_fit.rank < 3
+            ):
+                reason = "budget_exhausted" if evaluations >= evaluation_budget else "rank_deficient"
+                best_fit = seed_fit
+            else:
+                best_fit = seed_fit
+                tolerance = 1.0e-11 * max(1.0, f_hi - f_lo)
+                refinement_iterations = 0
+                while refinement_iterations < 100:
+                    refinement_iterations += 1
+                    if hi_freq - lo_freq <= tolerance:
+                        reason = "converged"
+                        break
+                    if refinement_iterations == 100:
+                        reason = "iteration_limit"
+                        break
+                    if x1_fit.sse <= x2_fit.sse:
+                        hi_freq, hi_fit = x2_freq, x2_fit
+                        x2_freq, x2_fit = x1_freq, x1_fit
+                        x1_freq = lo_freq + golden_left * (hi_freq - lo_freq)
+                        x1_fit = evaluate(x1_freq)
+                    else:
+                        lo_freq, lo_fit = x1_freq, x1_fit
+                        x1_freq, x1_fit = x2_freq, x2_fit
+                        x2_freq = lo_freq + golden_right * (hi_freq - lo_freq)
+                        x2_fit = evaluate(x2_freq)
+                    if x1_fit is None or x2_fit is None or x1_fit.rank < 3 or x2_fit.rank < 3:
+                        reason = "budget_exhausted" if evaluations >= evaluation_budget else "rank_deficient"
+                        break
+                    local_used = evaluations - evaluations_start
+                    best_fit = min(
+                        (best_fit, lo_fit, x1_fit, x2_fit, hi_fit),
+                        key=lambda item: (item.sse, item.frequency),
+                    )
+                    if hi_freq - lo_freq <= tolerance:
+                        reason = "converged"
+                        break
+
+            candidates.append(
+                _refined_from_fit(best_fit, seed_i - 1, local_used, reason)
+            )
+            if reason == "budget_exhausted":
+                global_reason = "budget_exhausted"
+            elif reason == "iteration_limit" and global_reason == "converged":
+                global_reason = "iteration_limit"
+            elif reason == "rank_deficient" and global_reason == "converged":
+                global_reason = "rank_deficient"
+
+    best: RefinedPeak | None = None
+    endpoint_choices: list[tuple[float, RefinedPeak]] = []
+    if candidates:
+        best = min(candidates, key=lambda item: (item.sse, item.frequency))
+        endpoint_choices.append((best.sse, best))
+    if left_fit is not None:
+        endpoint_choices.append((
+            left_fit.sse,
+            _refined_from_fit(left_fit, -1, 0, "endpoint"),
+        ))
+    if right_fit is not None:
+        endpoint_choices.append((
+            right_fit.sse,
+            _refined_from_fit(right_fit, -1, 0, "endpoint"),
+        ))
+    if endpoint_choices:
+        best = min(endpoint_choices, key=lambda item: (item[0], item[1].frequency))[1]
+
+    preferred = "none"
+    if best is not None:
+        endpoint_sse = min(
+            [fit.sse for fit in (left_fit, right_fit) if fit is not None],
+            default=math.inf,
+        )
+        interior_sse = min(
+            (candidate.sse for candidate in candidates), default=math.inf
+        )
+        tolerance = 1.0e-12 * max(1.0, abs(best.sse), endpoint_sse, interior_sse)
+        if not candidates:
+            preferred = "none" if math.isinf(endpoint_sse) else (
+                "left" if left_fit is not None and (
+                    right_fit is None or left_fit.sse <= right_fit.sse
+                ) else "right"
+            )
+        elif math.isinf(endpoint_sse):
+            preferred = "refined" if candidates else "none"
+        elif interior_sse < endpoint_sse - tolerance:
+            preferred = "refined"
+        elif endpoint_sse < interior_sse - tolerance:
+            preferred = "left" if left_fit is not None and (
+                right_fit is None or left_fit.sse <= right_fit.sse
+            ) else "right"
+        else:
+            preferred = "tie"
+
+    return RefinePeakResult(
+        best=best,
+        candidates=tuple(candidates),
+        endpoints=EndpointComparison(left=left_fit, right=right_fit, preferred=preferred),
+        scan_frequencies=tuple(grid),
+        rank_deficient_frequencies=tuple(rank_bad),
+        evaluations=evaluations,
+        evaluation_budget=evaluation_budget,
+        stopping_reason=global_reason,
     )

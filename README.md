@@ -5,6 +5,10 @@
 采用加权 Householder QR 最小二乘；功率定义为相对常量模型的加权残差平方和
 （SSE）减少比例。另计算采样窗口的归一化模用于解释周期别名。
 
+在此基础上，refine_peak(...) 在调用方给定的有限闭频率区间内先做确定性分段，
+再对每个局部 SSE 极小值做连续频率黄金分割细化；每个尝试频率仍重新消去常数、
+余弦、正弦三个线性系数，粗扫描点本身不会被直接宣布为连续最优。
+
 **不使用 FFT、不把不等间隔观测插值/补零成均匀序列**；每个观测就是设计矩阵的
 一行，重复时间、未排序时间均可直接处理。
 
@@ -16,11 +20,17 @@
 ## 运行
 
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（25 个）
-python demo.py                            # 约 0.1 秒完成真实计算
+python3.14 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip       # 可选；requirements.txt 为空
+python -m pip install -r requirements.txt # 无第三方包，离线环境也可跳过
+python -m unittest discover -s tests -v   # 32 个必要测试
+python demo_iteration.py                  # 约 0.2 秒的连续精化真实计算
+python demo.py                            # 基线固定网格谱演示，约 0.1 秒
 ```
 
-两条命令均在本机 Linux 原生验证（见文末“误差口径与验证结果”）。
+全部计算在本机 Linux 原生 Python 3.14.7 验证；venv 仅用于隔离，不访问外部
+服务，也不需要账号、密钥或 Docker（见文末“误差口径与验证结果”）。
 
 ## 接口
 
@@ -66,6 +76,37 @@ res = periodogram(times, values, weights, frequencies,
 `P(f) = (SSE0 − SSE(f)) / SSE0`，其中 `SSE0 = min_c Σw(y−c)²`（浮动均值常量
 模型），`SSE(f)` 为三参数模型的最小二乘残差。普通条件下 `0 ≤ P ≤ 1`。
 
+## 连续峰细化
+
+调用：
+
+    refine_peak(times, values, weights, frequency_min, frequency_max,
+                evaluation_budget=256, scan_points=81, rank_tol=None)
+
+frequency_min/frequency_max 是有限正实数，区间为闭区间且 max > min。
+evaluation_budget 为正 int（最小 5，拒绝 bool），统计真实新频率目标求值次数；
+scan_points 为不少于 5 的初始分段扫描点数，超过预算时由预算截断。
+
+算法先在区间内做确定性扫描，只把它用于切出多个局部候选；每个候选再在相邻
+扫描点构成的括号内做连续黄金分割。目标函数是“线性系数消元后的加权 SSE(f)”，
+因此不是取格点最大值，也不新增双频或多频模型。黄金分割不依赖导数；模块另外
+提供 single_sine_fit(...) 与 single_sine_derivative(...)，便于单点拟合与
+局部导数核对。
+
+RefinePeakResult 返回：
+
+- best：内部候选和两个闭区间端点中 SSE 最低的结果；
+- candidates：分段找到并局部细化的候选，含 frequency、amplitude、phase、
+  constant、sse、rank、segment_index、evaluations、stopping_reason；
+- endpoints：左右端点拟合及 preferred（refined、left、right、tie、none）；
+- scan_frequencies、rank_deficient_frequencies：初始扫描频率和秩亏位置；
+- evaluations、evaluation_budget 与总 stopping_reason。
+
+总停止原因包括 converged、budget_exhausted、rank_deficient、iteration_limit。
+区间可能含多个峰或由采样产生多个旁瓣；预算只保证优先细化扫描发现的候选，预算
+不足时不宣称全局最优。设计矩阵秩不足的频率不会成为好峰；候选为满秩三点时才
+进入局部优化。
+
 ## 错误语义
 
 - 所有数值输入拒绝 NaN / Infinity；整数参数（`top_k`、`selection_budget`）
@@ -98,11 +139,14 @@ res = periodogram(times, values, weights, frequencies,
 
 ## 已知限制（本题数学子集，不宣称行业标准兼容）
 
-- 仅实现本题契约：单变量时间、三参数正弦+常量模型、固定候选网格、标量权重；
-  不做多谐波、多信号联合拟合、误差棒传播、显著性/FAP 统计检验、Lomb–Scargle
-  标准时移或任何行业标准合规声明。
-- 不做频率精化（抛物线/亚格点拟合）；峰位置精度受候选网格步长限制，
-  离线格点的信号会有频谱泄漏（幅度被低估），这是物理效应而非数值缺陷。
+- 仅实现本题契约：单变量时间、固定网格三参数正弦+常量谱，以及连续频率上的
+  单正弦细化；标量权重；不做多谐波、双频/多信号联合拟合、误差棒传播、
+  显著性/FAP 统计检验、Lomb–Scargle 标准时移或任何行业标准合规声明。
+- 连续细化是局部搜索：初始分段扫描可能漏掉窄于扫描间距的峰；多峰、旁瓣或
+  预算过小时不保证全局最优，并通过 stopping_reason="budget_exhausted" 明示。
+- 固定网格 periodogram(...) 的峰位置仍受候选网格步长限制；离线格点信号会有
+  频谱泄漏（幅度被低估），这是物理效应而非数值缺陷。需要亚格点频率时对有限
+  区间调用 refine_peak(...)。
 - `phases` 在幅度接近 0 的 bin 上无物理意义（atan2(0,0)=0 的延续）。
 - 观测时间跨度与周期相比极大时，二进制64浮点本身的时间量化会改变输入问题
    （例如原点平移 1e9 后相对时间误差可达 ~2·ulp(1e9)≈2.4e-7）；模块在
@@ -133,7 +177,7 @@ res = periodogram(times, values, weights, frequencies,
 
 ## 测试与 demo 内容
 
-`tests/test_periodogram.py`（25 个用例）覆盖：
+`tests/test_periodogram.py`（32 个用例）覆盖：
 
 - 等间隔 DFT 解析恢复（格点纯谐波功率=1、闭式 DFT 系数）；
 - 手工加权正规方程独立参考（非均匀时间、非均匀权重、权重全局缩放不变）；
@@ -141,9 +185,24 @@ res = periodogram(times, values, weights, frequencies,
   采样秩亏；
 - 常量值（精确零功率约定）、周期镜像别名（`f0` 与 `f_s−f0` 等权，窗口解释）；
 - 局部峰/端点规则、排斥距离边界内闭、并列确定性、预算耗尽 vs 证明无解；
+- 非格点频率与不规则时间采样的连续细化、两个局部峰的分段后分别局部细化；
+- 独立高密度扫描 + 局部枚举核对、消元目标解析导数与独立有限差分核对；
+- 细化中的秩亏拒绝、预算耗尽、闭区间端点比较与新输入校验；
 - 全部输入校验（NaN/Inf、bool、长度/上限、频率递增与为正、类型可定位错误）。
 
-`python demo.py`（固定输入、确定性、约 0.1 秒，远低于 8 秒预算）：
+当前测试总数为 32 个（基线 25 个 + 连续精化 7 个），统一命令仍为
+python -m unittest discover -s tests -v。
+
+python demo_iteration.py（固定输入、确定性、实测约 0.2 秒，远低于 90 秒预算）：
+
+1. 使用 45 个不规则时间点构造两个局部单正弦拟合峰，粗网格步长 0.02；
+2. refine_peak(...) 分段后连续细化两个候选，报告振幅、相位、SSE、秩、
+   实际评估次数、停止原因与左右端点比较；
+3. 用独立 3×3 正规方程在最优点附近做 2401 点局部枚举，并比较消元 SSE；
+4. 用独立正规方程中心差分检查 single_sine_derivative(...)；
+5. 实际传入倒置区间并捕获 PeriodogramError。
+
+基线 python demo.py（固定输入、确定性、约 0.1 秒）：
 
 1. **正常结果**：25 晚 × 3 次的夜间观测节奏、注入 f=1.70/day 信号；
    真实计算出 `1.70 / 0.70 / 2.70` 三峰歧义（P≈0.999 与 0.989），
@@ -157,7 +216,8 @@ res = periodogram(times, values, weights, frequencies,
 ```
 periodogram.py             # 核心模块（唯一库文件）
 demo.py                    # 固定输入演示
-tests/test_periodogram.py  # 独立参考 + 25 个 unittest 用例
+tests/test_periodogram.py  # 独立参考 + 32 个 unittest 用例
+demo_iteration.py          # 连续峰细化、枚举与有限差分演示
 README.md
 requirements.txt           # 无第三方依赖（仅注释说明）
 ```

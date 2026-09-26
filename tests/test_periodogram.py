@@ -18,7 +18,13 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import periodogram as pg
-from periodogram import periodogram, PeriodogramError, EPS
+from periodogram import (
+    periodogram,
+    refine_peak,
+    single_sine_derivative,
+    PeriodogramError,
+    EPS,
+)
 
 TWO_PI = 2.0 * math.pi
 
@@ -601,6 +607,193 @@ class TestInputValidation(unittest.TestCase):
         self.assertEqual(len(res.frequencies), len(res.window))
         with self.assertRaises(Exception):
             res.powers = ()  # type: ignore[misc]
+
+
+class TestContinuousPeakRefinement(unittest.TestCase):
+    @staticmethod
+    def independent_sse(times, values, freq):
+        _, _, _, sse, _, _ = normal_equation_reference(
+            times, values, [1.0] * len(times), freq
+        )
+        return sse
+
+    def independent_scan_minimum(self, times, values, f_lo, f_hi, points):
+        grid = [
+            f_lo + i * (f_hi - f_lo) / (points - 1)
+            for i in range(points)
+        ]
+        return min(
+            ((self.independent_sse(times, values, freq), freq) for freq in grid),
+            key=lambda item: item[0],
+        )
+
+    def independent_local_enumeration(self, times, values, center, width=0.006):
+        points = 2001
+        best_sse = math.inf
+        best_f = center
+        for i in range(points):
+            freq = center - width + 2.0 * width * i / (points - 1)
+            sse = self.independent_sse(times, values, freq)
+            if sse < best_sse:
+                best_sse, best_f = sse, freq
+        return best_sse, best_f
+
+    def test_non_grid_irregular_single_peak_refined_past_grid(self):
+        n = 45
+        rnd = lcg(818, 2 * n)
+        times = sorted(8.0 * u for u in rnd[:n])
+        f_true = 0.734521
+        amp_true, phase_true = 1.2, -0.4
+        values = [
+            amp_true * math.cos(TWO_PI * f_true * t - phase_true)
+            + 0.01 * math.sin(2.7 * t)
+            for t in times
+        ]
+
+        coarse_step = 0.02
+        grid = [0.55 + coarse_step * i for i in range(21)]
+        coarse = periodogram(times, values, None, grid)
+        coarse_best = grid[max(range(len(grid)), key=lambda i: coarse.powers[i])]
+        result = refine_peak(
+            times, values, None, 0.55, 0.95,
+            evaluation_budget=220, scan_points=31,
+        )
+
+        dense_sse, dense_f = self.independent_scan_minimum(
+            times, values, 0.55, 0.95, 2001
+        )
+        local_sse, local_f = self.independent_local_enumeration(
+            times, values, dense_f
+        )
+        self.assertEqual(result.stopping_reason, "converged")
+        self.assertIsNotNone(result.best)
+        self.assertEqual(result.best.rank, 3)
+        self.assertNotEqual(result.best.frequency, coarse_best)
+        self.assertLess(abs(result.best.frequency - local_f), 2.0e-4)
+        self.assertLessEqual(result.best.sse, dense_sse + 1.0e-12)
+        self.assertLess(abs(result.best.sse - local_sse), 1.0e-8 + 1.0e-9 * local_sse)
+        self.assertEqual(result.endpoints.preferred, "refined")
+
+    def test_two_local_peaks_are_segmented_then_refined_separately(self):
+        n = 45
+        rnd = lcg(202, 2 * n)
+        times = sorted(8.0 * u for u in rnd[:n])
+        f1, f2 = 0.71325, 0.94761
+        values = [
+            1.15 * math.cos(TWO_PI * f1 * t - 0.3)
+            + 0.90 * math.cos(TWO_PI * f2 * t + 0.7)
+            for t in times
+        ]
+
+        result = refine_peak(
+            times, values, None, 0.55, 1.15,
+            evaluation_budget=260, scan_points=61,
+        )
+        self.assertEqual(result.stopping_reason, "converged")
+        self.assertGreaterEqual(len(result.candidates), 2)
+        self.assertTrue(all(
+            candidate.stopping_reason == "converged"
+            for candidate in result.candidates
+        ))
+
+        independent_minima = []
+        for center in (0.6975, 0.967):
+            sse, freq = self.independent_local_enumeration(
+                times, values, center, width=0.01
+            )
+            independent_minima.append((sse, freq))
+        refined = sorted(result.candidates, key=lambda item: item.sse)
+        chosen = sorted(refined[:2], key=lambda item: item.frequency)
+        independent_minima.sort(key=lambda item: item[1])
+        for candidate, (ref_sse, ref_f) in zip(chosen, independent_minima):
+            self.assertEqual(candidate.rank, 3)
+            self.assertLess(abs(candidate.frequency - ref_f), 2.0e-4)
+            self.assertLess(abs(candidate.sse - ref_sse), 2.0e-8 + 1.0e-9 * ref_sse)
+            self.assertLessEqual(candidate.sse, ref_sse + 1.0e-10)
+
+    def test_profiled_objective_derivative_matches_finite_difference(self):
+        n = 31
+        rnd = lcg(606, 2 * n)
+        times = sorted(7.0 * u for u in rnd[:n])
+        values = [
+            0.8 * math.cos(TWO_PI * 0.431 * t + 0.2)
+            + 0.15 * math.sin(1.3 * t)
+            for t in times
+        ]
+        for f0 in (0.37, 0.431, 0.58):
+            derivative = single_sine_derivative(
+                times, values, None, f0
+            ).derivative
+            h = 1.0e-6
+            finite_difference = (
+                self.independent_sse(times, values, f0 + h)
+                - self.independent_sse(times, values, f0 - h)
+            ) / (2.0 * h)
+            self.assertAlmostEqual(
+                derivative / max(1.0, abs(finite_difference)),
+                finite_difference / max(1.0, abs(finite_difference)),
+                delta=2.0e-7,
+            )
+
+    def test_rank_deficient_frequency_is_not_a_good_peak(self):
+        times = [1.5] * 6
+        values = [0.2, 1.1, -0.3, 0.8, 0.4, 0.9]
+        result = refine_peak(times, values, None, 0.2, 0.8)
+        self.assertEqual(result.stopping_reason, "rank_deficient")
+        self.assertEqual(result.candidates, ())
+        self.assertIsNone(result.best)
+        self.assertIsNone(result.endpoints.left)
+        self.assertIsNone(result.endpoints.right)
+        self.assertEqual(result.endpoints.preferred, "none")
+        self.assertEqual(len(result.rank_deficient_frequencies), result.evaluations)
+
+    def test_budget_exhaustion_is_reported_without_global_claim(self):
+        n = 45
+        rnd = lcg(202, 2 * n)
+        times = sorted(8.0 * u for u in rnd[:n])
+        values = [
+            1.15 * math.cos(TWO_PI * 0.71325 * t - 0.3)
+            + 0.90 * math.cos(TWO_PI * 0.94761 * t + 0.7)
+            for t in times
+        ]
+        result = refine_peak(
+            times, values, None, 0.55, 1.15,
+            evaluation_budget=61, scan_points=61,
+        )
+        self.assertEqual(result.evaluations, 61)
+        self.assertEqual(result.stopping_reason, "budget_exhausted")
+        self.assertTrue(any(
+            candidate.stopping_reason == "budget_exhausted"
+            for candidate in result.candidates
+        ))
+
+    def test_endpoint_comparison_can_prefer_closed_boundary(self):
+        n = 37
+        rnd = lcg(919, 2 * n)
+        times = sorted(5.0 * u for u in rnd[:n])
+        f0 = 0.6125
+        values = [
+            math.cos(TWO_PI * f0 * t - 0.2) + 0.02 * math.sin(2.0 * t)
+            for t in times
+        ]
+        result = refine_peak(
+            times, values, None, f0, f0 + 0.02,
+            evaluation_budget=120, scan_points=31,
+        )
+        self.assertEqual(result.endpoints.preferred, "left")
+        self.assertIsNotNone(result.best)
+        self.assertLessEqual(result.best.sse, result.endpoints.right.sse)
+        self.assertAlmostEqual(result.best.frequency, f0, delta=1.0e-10)
+
+    def test_refine_input_validation(self):
+        good = [0.0, 0.2, 0.8, 1.1, 1.6]
+        values = [0.1, 0.9, -0.2, 0.7, 0.3]
+        with self.assertRaisesRegex(PeriodogramError, "frequency_max"):
+            refine_peak(good, values, None, 0.8, 0.8)
+        with self.assertRaisesRegex(PeriodogramError, "evaluation_budget"):
+            refine_peak(good, values, None, 0.2, 0.8, evaluation_budget=True)
+        with self.assertRaisesRegex(PeriodogramError, "scan_points"):
+            refine_peak(good, values, None, 0.2, 0.8, scan_points=2)
 
 
 class TestWindowDirectReference(unittest.TestCase):

@@ -15,12 +15,17 @@
 
 ## 运行
 
+隔离 venv 准备（可选但推荐；模块仅用标准库，venv 内无需 pip install 任何包）：
+
 ```bash
-python -m unittest discover -s tests -v   # 必要测试（25 个）
-python demo.py                            # 约 0.1 秒完成真实计算
+python3.14 -m venv .venv          # 隔离环境，不污染系统 Python
+.venv/bin/python -m unittest discover -s tests -v   # 必要测试（46 个）
+.venv/bin/python demo.py                            # 约 0.1 秒
+.venv/bin/python demo_iteration.py                  # 频率细化演示，约 1 秒（预算 90 秒）
 ```
 
-两条命令均在本机 Linux 原生验证（见文末“误差口径与验证结果”）。
+直接用系统 `python` 运行同样可行（无第三方依赖）。所有命令均在本机
+Linux 原生验证（见文末“误差口径与验证结果”）。
 
 ## 接口
 
@@ -60,6 +65,47 @@ res = periodogram(times, values, weights, frequencies,
     这是在确定性贪心规则下**可证明无更多可选峰**的结果；
   - `"budget_exhausted"`：`selection_budget` 用尽、扫描提前终止；
     对未检查候选不作任何断言。**预算耗尽与证明无解严格分开**。
+
+## 峰频率细化：refine_peak
+
+```python
+from periodogram import refine_peak, RefinedPeak
+
+ref = refine_peak(times, values, weights, f_low, f_high,
+                  *, segments=64, eval_budget=None, rank_tol=None, xtol=None)
+```
+
+在**有限频率区间** `[f_low, f_high]`（`0 < f_low < f_high`）内细化单正弦
+模型的最优频率。目标函数是消元后的残差：每个频率处线性系数
+`(c, a, b)` 仍由与 `periodogram` 相同的加权 Householder QR 拟合消去，
+最小化 `SSE(f)`——**不把格点功率最大值直接当作连续最优**。不引入
+双频/多频模型。
+
+流程：区间先按 `segments` 段均匀扫描，每个严格内部 SSE 极小且设计矩阵
+满秩（rank 3）的格点成为候选；候选按粗扫 SSE 升序，各自在相邻两格内做
+黄金分割局部细化，取最优者。区间内可能有多个峰（如周日别名），预算
+不足时**不保证全局最优**，以停止原因如实报告。
+
+| 参数 | 契约 |
+|---|---|
+| `times/values/weights` | 与 `periodogram` 完全相同 |
+| `f_low, f_high` | 有限实数，`0 < f_low < f_high` |
+| `segments` | 粗扫分段数，int ≥ 4（拒绝 bool），默认 64 |
+| `eval_budget` | 目标函数评估总次数上限（含粗扫）；`None` = `16*segments+64` |
+| `rank_tol` / `xtol` | 秩阈值同 `periodogram`；`xtol` 默认 `1e-10*(f_high-f_low)` |
+
+返回不可变值对象 `RefinedPeak`：
+
+- `frequency, amplitude, phase, constant, sse, rank, power`：细化频率及
+  该频率下的拟合量（幅度/相位已转回原时间参考系）。
+- `sse_low, sse_high, boundary_lower`：**区间端点比较**——两端点的残差
+  SSE，以及端点是否优于内部细化极小（为真说明区间可能未 bracket 住峰）。
+- `n_evaluations, n_candidates`：实际评估次数与候选数。
+- `stop_reason`：
+  - `"converged"`：所有候选均细化到 `xtol` 容差；
+  - `"budget_exhausted"`：预算耗尽，返回目前最优，**不保证全局最优**；
+  - `"boundary_minimum"`：无满秩内部候选（如唯一的 SSE 极小处设计矩阵
+    秩亏——**秩不足的位置不能当好峰**），退而报告最优满秩格点。
 
 ### 功率定义
 
@@ -101,8 +147,11 @@ res = periodogram(times, values, weights, frequencies,
 - 仅实现本题契约：单变量时间、三参数正弦+常量模型、固定候选网格、标量权重；
   不做多谐波、多信号联合拟合、误差棒传播、显著性/FAP 统计检验、Lomb–Scargle
   标准时移或任何行业标准合规声明。
-- 不做频率精化（抛物线/亚格点拟合）；峰位置精度受候选网格步长限制，
-  离线格点的信号会有频谱泄漏（幅度被低估），这是物理效应而非数值缺陷。
+- `periodogram` 本身不做频率精化；亚格点峰位用 `refine_peak` 在有限
+  区间内按消元残差细化（见上节）。离线格点的信号会有频谱泄漏
+  （幅度被低估），这是物理效应而非数值缺陷。
+- `refine_peak` 仍只拟合**单正弦**模型；多峰区间内它返回预算内找到的
+  最优候选，预算耗尽时不保证全局最优（`stop_reason` 如实区分）。
 - `phases` 在幅度接近 0 的 bin 上无物理意义（atan2(0,0)=0 的延续）。
 - 观测时间跨度与周期相比极大时，二进制64浮点本身的时间量化会改变输入问题
    （例如原点平移 1e9 后相对时间误差可达 ~2·ulp(1e9)≈2.4e-7）；模块在
@@ -143,6 +192,23 @@ res = periodogram(times, values, weights, frequencies,
 - 局部峰/端点规则、排斥距离边界内闭、并列确定性、预算耗尽 vs 证明无解；
 - 全部输入校验（NaN/Inf、bool、长度/上限、频率递增与为正、类型可定位错误）。
 
+`tests/test_refine_peak.py`（21 个用例）覆盖：
+
+- 已知非格点频率 + 不规则时间采样 + 非均匀权重的恢复（频率、幅度、
+  相位、常数对照独立 3×3 正规方程参考）；
+- 同一区间内两个局部峰（1/day 别名对）：多候选计数、最优峰为真峰、
+  子区间内别名额峰同样被细化为局部最优；
+- 独立高密度扫描（1001 点）+ 局部枚举核对：细化 SSE 不劣于任何密集
+  格点；目标在解处的有限差分一阶导数与曲率相容（平稳性检验）；
+- 秩亏位置（半整数采样下 f=1 的 sin 列恒零）不得成为峰、常量数据无
+  内部峰；预算耗尽与收敛严格区分且评估次数不超预算；全部输入校验。
+
+`python demo_iteration.py`（固定输入、确定性、约 1 秒，远低于 90 秒
+预算）：35 晚 × 3 次的夜间节奏注入 f=1.7135/day 非格点信号，区间内
+存在 f0±1 别名多峰；真实计算细化频率（误差 ~3e-5）、幅度/相位、端点
+SSE 比较与停止原因，并用独立正规方程做 2601 点高密度扫描现场核对，
+另演示预算耗尽时的如实报告。
+
 `python demo.py`（固定输入、确定性、约 0.1 秒，远低于 8 秒预算）：
 
 1. **正常结果**：25 晚 × 3 次的夜间观测节奏、注入 f=1.70/day 信号；
@@ -157,7 +223,9 @@ res = periodogram(times, values, weights, frequencies,
 ```
 periodogram.py             # 核心模块（唯一库文件）
 demo.py                    # 固定输入演示
+demo_iteration.py          # refine_peak 真实离线演示（< 90 秒）
 tests/test_periodogram.py  # 独立参考 + 25 个 unittest 用例
+tests/test_refine_peak.py  # refine_peak 独立参考 + 21 个 unittest 用例
 README.md
 requirements.txt           # 无第三方依赖（仅注释说明）
 ```
